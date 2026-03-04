@@ -1,0 +1,24 @@
+/**:
+  ros__parameters:
+    # Spatial filter (points outside are not considered for clustering)
+    r_min: 0.0
+    r_max: 40.0
+    z_min: -2.6
+    z_max: 2.0
+    intensity_threshold: 4.0
+
+    # Euclidean clustering (grid-indexed)
+    cluster_eps: 0.7
+    cluster_min_pts: 7
+    z_scale: 5.0
+
+    # Cluster-based noise rules (entropy and weak return count)
+    entropy_noise_thresh: 0.3
+    weak_count_noise_thresh: 5
+
+    # Return type sets (weak returns often indicate noise)
+    return_weak_numbers: [2, 3, 4, 5, 7, 9]
+    return_strong_numbers: [1, 6, 8, 10]
+
+    # Debug
+    publish_noise_cloud: true
