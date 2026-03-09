@@ -17,10 +17,8 @@
 
 #include "autoware/pointcloud_preprocessor/filter.hpp"
 
-#include <diagnostic_updater/diagnostic_updater.hpp>
 #include <rclcpp/rclcpp.hpp>
 
-#include <autoware_internal_debug_msgs/msg/float32_stamped.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 
@@ -49,8 +47,6 @@ struct Zone
   double r_step{};
   double az_step{};
   double z_step{};
-  double ground_z_pos_estim{};
-  double ground_z_ignore_offset{};
   double intensity_threshold{};
 };
 
@@ -130,7 +126,6 @@ struct VoxelPointCounts
 {
   size_t primary_count{0};
   size_t secondary_count{0};
-  bool is_in_visibility_range{true};
 
   // Threshold checks (inclusive)
   [[nodiscard]] bool meets_primary_threshold(int threshold) const
@@ -175,7 +170,7 @@ protected:
   // Parameter update helper methods
   void update_primary_return_types(const rclcpp::Parameter & param);
   void update_publish_noise_cloud(const rclcpp::Parameter & param);
-  void update_return_weak_strong(const rclcpp::Parameter & param);
+  void update_secondary_return_types(const rclcpp::Parameter & param);
 
   // Type aliases to eliminate long type name duplication
   using PointCloud2 = sensor_msgs::msg::PointCloud2;
@@ -202,14 +197,14 @@ protected:
     float intensity{};
     int return_type{};
   };
-  static bool is_voxel_noise_low_count(
-    int count, float int_avg, int ret_weak, const std::string & zone_name);
-  static bool is_voxel_noise(const VoxelMetrics & m, const std::string & zone_name);
+  bool is_voxel_noise_low_count(
+    int count, float int_avg, int ret_weak, const std::string & zone_name) const;
+  bool is_voxel_noise(const VoxelMetrics & m, const std::string & zone_name) const;
   bool compute_metrics(
     const std::vector<ZonePoint> & points, const std::vector<size_t> & indices,
     VoxelMetrics & out) const;
-  int return_weak_count(int return_type) const;
-  int return_strong_count(int return_type) const;
+  int count_secondary_returns(int return_type) const;
+  int count_primary_returns(int return_type) const;
 
   PointVoxelInfoVector collect_voxel_info(const PointCloud2 & input);
   VoxelPointCountMap count_voxel_points(const PointVoxelInfoVector & point_voxel_info) const;
@@ -219,13 +214,10 @@ protected:
   VoxelIndexSet determine_valid_voxels(const VoxelPointCountMap & voxel_point_counts) const;
   ValidPointsMask create_valid_points_mask(
     const PointVoxelInfoVector & point_voxel_info, const VoxelIndexSet & valid_voxels) const;
-  static void create_filtered_output(
+  void create_filtered_output(
     const PointCloud2 & input, const ValidPointsMask & valid_points_mask, PointCloud2 & output);
   void publish_noise_cloud(
     const PointCloud2 & input, const ValidPointsMask & valid_points_mask) const;
-  void publish_diagnostics(
-    const VoxelPointCountMap & voxel_point_counts, const ValidPointsMask & valid_points_mask);
-
   // Point processing helper methods
   void process_polar_points(const PointCloud2 & input, PointVoxelInfoVector & point_voxel_info);
 
@@ -262,10 +254,8 @@ protected:
   bool meets_intensity_threshold(uint8_t intensity) const;
   static bool has_polar_coordinates(const PointCloud2 & input);
 
-  // Parameter callback and diagnostics
+  // Parameter callback
   rcl_interfaces::msg::SetParametersResult param_callback(const std::vector<rclcpp::Parameter> & p);
-  void on_visibility_check(diagnostic_updater::DiagnosticStatusWrapper & stat);
-  void on_filter_ratio_check(diagnostic_updater::DiagnosticStatusWrapper & stat);
 
   // Parameters
   double radial_resolution_m_{};
@@ -274,45 +264,41 @@ protected:
   int voxel_points_threshold_{};
   double min_radius_m_{};
   double max_radius_m_{};
-  double visibility_estimation_max_range_m_{};
   bool use_return_type_classification_{};
   bool enable_secondary_return_filtering_{};
   int secondary_noise_threshold_{};
   int intensity_threshold_{};
   std::vector<int> primary_return_types_;
   bool publish_noise_cloud_{};
-  int visibility_estimation_max_secondary_voxel_count_{};
-  bool visibility_estimation_only_{};
 
   // Near/far zones geometric noise filter (from voxel_filter_rules)
   bool use_near_far_zones_{false};
-  std::set<int> return_weak_numbers_;
-  std::set<int> return_strong_numbers_;
+  std::set<int> secondary_return_types_;
   std::vector<Zone> zones_;
 
-  // Diagnostic thresholds
-  double visibility_error_threshold_{};
-  double visibility_warn_threshold_{};
-  double filter_ratio_error_threshold_{};
-  double filter_ratio_warn_threshold_{};
+  // is_voxel_noise_low_count parameters: (count < count_threshold && int_avg < intensity_avg_threshold)
+  // || (ret_secondary > ret_secondary_threshold && int_avg < intensity_avg_threshold)
+  int voxel_noise_low_count_threshold_{5};
+  float voxel_noise_intensity_avg_threshold_{0.01f};
+  int voxel_noise_ret_secondary_threshold_{5};
 
-  // State variables (protected by mutex_)
-  std::optional<double> visibility_;
-  std::optional<double> filter_ratio_;
+  // is_voxel_noise parameters per zone: (count >= count_min && count <= count_max && int_avg < int_avg_max && ent > ent_min && anis < anis_max)
+  int near_voxel_noise_count_min_{5};
+  int near_voxel_noise_count_max_{20};
+  float near_voxel_noise_int_avg_max_{0.01f};
+  float near_voxel_noise_ent_min_{0.1f};
+  float near_voxel_noise_anis_max_{0.995f};
+  int far_voxel_noise_count_min_{7};
+  int far_voxel_noise_count_max_{25};
+  float far_voxel_noise_int_avg_max_{0.01f};
+  float far_voxel_noise_ent_min_{0.1f};
+  float far_voxel_noise_anis_max_{0.995f};
+
   std::mutex mutex_;
 
-  // Publishers and diagnostics
-  rclcpp::Publisher<autoware_internal_debug_msgs::msg::Float32Stamped>::SharedPtr visibility_pub_;
-  rclcpp::Publisher<autoware_internal_debug_msgs::msg::Float32Stamped>::SharedPtr ratio_pub_;
+  // Publishers
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr noise_cloud_pub_;
-  diagnostic_updater::Updater updater_;
   OnSetParametersCallbackHandle::SharedPtr set_param_res_;
-
-  // Diagnostic helper methods
-  void calculate_visibility_metric(const VoxelPointCountMap & voxel_point_counts);
-  void calculate_filter_ratio_metric(const ValidPointsMask & valid_points_mask);
-  void publish_visibility_metric();
-  void publish_filter_ratio_metric();
 
   // Filter pipeline helper methods
   void validate_filter_inputs(const PointCloud2 & input, const IndicesPtr & indices);
