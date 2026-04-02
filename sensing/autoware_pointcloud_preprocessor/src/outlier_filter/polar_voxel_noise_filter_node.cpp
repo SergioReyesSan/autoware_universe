@@ -15,21 +15,19 @@
 #include "autoware/pointcloud_preprocessor/outlier_filter/polar_voxel_noise_filter_node.hpp"
 
 #include <autoware/pointcloud_preprocessor/utility/memory.hpp>
+#include <diagnostic_updater/diagnostic_updater.hpp>
 
+#include <autoware_internal_debug_msgs/msg/float32_stamped.hpp>
+#include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 
-#include <Eigen/Dense>
-#include <Eigen/Eigenvalues>
-
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -39,8 +37,10 @@
 namespace autoware::pointcloud_preprocessor
 {
 
+static constexpr double diagnostics_update_period_sec = 0.1;
 static constexpr size_t point_cloud_height_organized = 1;
 static constexpr double TWO_PI = 2.0 * M_PI;
+static constexpr int marker_resolution = 50;
 
 template <typename... T>
 bool all_finite(T... values)
@@ -55,9 +55,33 @@ inline double adjust_resolution_to_circle(double requested_resolution)
   return TWO_PI / bins;
 }
 
+static inline bool within_circular_range(
+  const double & value_lower, const double & value_upper, const double & user_min,
+  const double & user_max, const double & domain_min, const double & domain_max)
+{
+  double user_min_mod = std::fmod(user_min, TWO_PI);
+  double user_max_mod = std::fmod(user_max, TWO_PI);
+  bool within_range = false;
+  if (user_min_mod < user_max_mod) {
+    // Normal case
+    within_range = user_min_mod <= value_lower && value_upper <= user_max_mod;
+  } else {
+    // Circular case
+    within_range = (user_min_mod <= value_lower && value_upper <= domain_max) ||
+                   (domain_min <= value_lower && value_upper <= user_max_mod);
+  }
+  return within_range;
+}
+
+
 PolarVoxelNoiseFilterComponent::PolarVoxelNoiseFilterComponent(
   const rclcpp::NodeOptions & options)
-: Filter("PolarVoxelNoiseFilter", options)
+: Filter("PolarVoxelNoiseFilter", options),
+  azimuth_domain_min(0.0),
+  azimuth_domain_max(TWO_PI),
+  elevation_domain_min(-M_PI / 2.0),
+  elevation_domain_max(M_PI / 2.0)//,
+  // updater_(this)
 {
   radial_resolution_m_ = declare_parameter<double>("radial_resolution_m");
   azimuth_resolution_rad_ =
@@ -72,7 +96,6 @@ PolarVoxelNoiseFilterComponent::PolarVoxelNoiseFilterComponent(
   secondary_noise_threshold_ =
     static_cast<int>(declare_parameter<int64_t>("secondary_noise_threshold"));
   publish_noise_cloud_ = declare_parameter<bool>("publish_noise_cloud");
-  intensity_threshold_ = declare_parameter<uint8_t>("intensity_threshold");
 
   auto primary_return_types_param = declare_parameter<std::vector<int64_t>>("primary_return_types");
   primary_return_types_.clear();
@@ -82,52 +105,15 @@ PolarVoxelNoiseFilterComponent::PolarVoxelNoiseFilterComponent(
     RCLCPP_DEBUG(get_logger(), "primary_return_types_ value: %d", static_cast<int>(val));
   }
 
-  voxel_noise_low_count_threshold_ =
-    static_cast<int>(declare_parameter<int64_t>("voxel_noise_low_count_threshold", 5));
-  voxel_noise_intensity_avg_threshold_ =
-    static_cast<float>(declare_parameter<double>("voxel_noise_intensity_avg_threshold", 0.01));
-  voxel_noise_ret_secondary_threshold_ =
-    static_cast<int>(declare_parameter<int64_t>("voxel_noise_ret_secondary_threshold", 5));
-
-  // is_voxel_noise thresholds per zone (count, int_avg, ent, anis)
-  near_voxel_noise_count_min_ =
-    static_cast<int>(declare_parameter<int64_t>("near_voxel_noise_count_min", 5));
-  near_voxel_noise_count_max_ =
-    static_cast<int>(declare_parameter<int64_t>("near_voxel_noise_count_max", 20));
-  near_voxel_noise_int_avg_max_ =
-    static_cast<float>(declare_parameter<double>("near_voxel_noise_int_avg_max", 0.01));
-  near_voxel_noise_ent_min_ =
-    static_cast<float>(declare_parameter<double>("near_voxel_noise_ent_min", 0.1));
-  near_voxel_noise_anis_max_ =
-    static_cast<float>(declare_parameter<double>("near_voxel_noise_anis_max", 0.995));
-  far_voxel_noise_count_min_ =
-    static_cast<int>(declare_parameter<int64_t>("far_voxel_noise_count_min", 7));
-  far_voxel_noise_count_max_ =
-    static_cast<int>(declare_parameter<int64_t>("far_voxel_noise_count_max", 25));
-  far_voxel_noise_int_avg_max_ =
-    static_cast<float>(declare_parameter<double>("far_voxel_noise_int_avg_max", 0.01));
-  far_voxel_noise_ent_min_ =
-    static_cast<float>(declare_parameter<double>("far_voxel_noise_ent_min", 0.1));
-  far_voxel_noise_anis_max_ =
-    static_cast<float>(declare_parameter<double>("far_voxel_noise_anis_max", 0.995));
-
-  // Near/far zones geometric noise filter (voxel_filter_rules style)
-  use_near_far_zones_ = declare_parameter<bool>("use_near_far_zones", false);
-  auto secondary_param = declare_parameter<std::vector<int64_t>>("secondary_return_types", std::vector<int64_t>{3, 4, 5, 7, 9});
-  for (int64_t v : secondary_param) {
-    secondary_return_types_.insert(static_cast<int>(v));
-  }
-  // primary_return_types is already declared above and used for both filter and zone "strong" classification
-  declare_zone_parameters();
-  zones_ = build_zones_from_params();
-
+  intensity_threshold_ = declare_parameter<uint8_t>("intensity_threshold");
+  avg_intensity_threshold_ = declare_parameter<double>("avg_intensity_threshold");
 
   // Create noise cloud publisher if enabled
   if (publish_noise_cloud_) {
     rclcpp::PublisherOptions pub_options;
     pub_options.qos_overriding_options = rclcpp::QosOverridingOptions::with_default_policies();
     noise_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-      "polar_voxel_noise_filter/debug_s/pointcloud_noise", rclcpp::SensorDataQoS(), pub_options);
+      "polar_voxel_noise_filter/debug/pointcloud_noise", rclcpp::SensorDataQoS(), pub_options);
     RCLCPP_INFO(get_logger(), "Noise cloud publishing enabled");
   } else {
     RCLCPP_INFO(get_logger(), "Noise cloud publishing disabled for performance optimization");
@@ -139,8 +125,7 @@ PolarVoxelNoiseFilterComponent::PolarVoxelNoiseFilterComponent(
 
   RCLCPP_INFO(
     get_logger(),
-    "Polar Voxel Noise Filter initialized - supports PointXYZIRC and PointXYZIRCAEDT with %s "
-    "filtering",
+    "Polar Voxel Noise Filter initialized - supports PointXYZIRC and PointXYZIRCAEDT with %s",
     use_return_type_classification_ ? "advanced two-criteria" : "simple occupancy");
 }
 
@@ -157,255 +142,142 @@ void PolarVoxelNoiseFilterComponent::filter(
   // Phase 1: Validate inputs
   validate_filter_inputs(*input, indices);
 
-  if (use_near_far_zones_) {
-    ValidPointsMask valid_mask;
-    filter_with_near_far_zones(*input, output, valid_mask);
-    if (publish_noise_cloud_) {
-      publish_noise_cloud(*input, valid_mask);
-    }
-    return;
+  // Check if we have pre-computed polar coordinates
+  bool has_polar_coords = has_polar_coordinates(*input);
+
+  if (has_polar_coords) {
+    RCLCPP_DEBUG_ONCE(
+      get_logger(), "Processing PointXYZIRCAEDT format with pre-computed polar coordinates");
+  } else {
+    RCLCPP_DEBUG_ONCE(
+      get_logger(), "Processing PointXYZIRC format, computing azimuth and elevation");
+  }
+
+  // Phase 2: Collect voxel information (unified for both formats)
+  auto point_voxel_info = collect_voxel_info(*input);
+
+  // Phase 3: Analyze per-voxel statistics and validate voxels
+  auto voxel_stats_map = analyze_voxel_stats(point_voxel_info);
+  auto valid_voxels = determine_valid_voxels(voxel_stats_map);
+
+  // Phase 4: Create valid points mask
+  auto valid_points_mask = create_valid_points_mask(point_voxel_info, valid_voxels);
+
+  // Phase 5: Create output (normal or empty based on mode)
+  create_output(*input, valid_points_mask, output);
+
+  // Phase 6: Conditionally publish noise cloud
+  if (publish_noise_cloud_) {
+    publish_noise_cloud(*input, valid_points_mask);
+  }
+
+}
+
+PolarVoxelNoiseFilterComponent::PointVoxelInfoVector
+PolarVoxelNoiseFilterComponent::collect_voxel_info(const PointCloud2 & input)
+{
+  PointVoxelInfoVector point_voxel_info;
+  point_voxel_info.reserve(input.width * input.height);
+
+  bool has_polar_coords = has_polar_coordinates(input);
+
+  if (has_polar_coords) {
+    process_polar_points(input, point_voxel_info);
+  } else {
+    process_cartesian_points(input, point_voxel_info);
+  }
+
+  return point_voxel_info;
+}
+
+void PolarVoxelNoiseFilterComponent::process_polar_points(
+  const PointCloud2 & input, PointVoxelInfoVector & point_voxel_info)
+{
+  // Create iterators for polar coordinates (always exist for polar format)
+  sensor_msgs::PointCloud2ConstIterator<float> iter_distance(input, "distance");
+  sensor_msgs::PointCloud2ConstIterator<float> iter_azimuth(input, "azimuth");
+  sensor_msgs::PointCloud2ConstIterator<float> iter_elevation(input, "elevation");
+  sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_intensity(input, "intensity");
+  sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_return_type(input, "return_type");
+
+  for (; iter_distance != iter_distance.end();
+       ++iter_distance, ++iter_azimuth, ++iter_elevation, ++iter_intensity, ++iter_return_type) {
+    point_voxel_info.emplace_back(process_polar_point(
+      *iter_distance, *iter_azimuth, *iter_elevation, *iter_intensity, *iter_return_type));
   }
 }
 
-void PolarVoxelNoiseFilterComponent::declare_zone_parameters()
+void PolarVoxelNoiseFilterComponent::process_cartesian_points(
+  const PointCloud2 & input, PointVoxelInfoVector & point_voxel_info)
 {
-  this->declare_parameter("near_radius_min", 0.0);
-  this->declare_parameter("near_radi_max", 20.0);
-  this->declare_parameter("near_z_min", -10.0);
-  this->declare_parameter("near_z_max", 10.0);
-  this->declare_parameter("near_radius_step", 0.6);
-  this->declare_parameter("near_azimuth_step", 0.1);
-  this->declare_parameter("near_z_step", 0.6);
-  this->declare_parameter("near_intensity_threshold", 0.5);
-  this->declare_parameter("far_radius_min", 20.0);
-  this->declare_parameter("far_radius_max", 60.0);
-  this->declare_parameter("far_z_min", -10.0);
-  this->declare_parameter("far_z_max", 10.0);
-  this->declare_parameter("far_radius_step", 0.6);
-  this->declare_parameter("far_azimuth_step", 0.1);
-  this->declare_parameter("far_z_step", 0.6);
-  this->declare_parameter("far_intensity_threshold", 0.5);
-}
-
-std::vector<Zone> PolarVoxelNoiseFilterComponent::build_zones_from_params() const
-{
-  std::vector<Zone> z;
-  z.push_back(
-    {"Near",
-     this->get_parameter("near_radius_min").as_double(),
-     this->get_parameter("near_radi_max").as_double(),
-     this->get_parameter("near_z_min").as_double(),
-     this->get_parameter("near_z_max").as_double(),
-     this->get_parameter("near_radius_step").as_double(),
-     this->get_parameter("near_azimuth_step").as_double(),
-     this->get_parameter("near_z_step").as_double(),
-     this->get_parameter("near_intensity_threshold").as_double()});
-  z.push_back(
-    {"Far",
-     this->get_parameter("far_radius_min").as_double(),
-     this->get_parameter("far_radius_max").as_double(),
-     this->get_parameter("far_z_min").as_double(),
-     this->get_parameter("far_z_max").as_double(),
-     this->get_parameter("far_radius_step").as_double(),
-     this->get_parameter("far_azimuth_step").as_double(),
-     this->get_parameter("far_z_step").as_double(),
-     this->get_parameter("far_intensity_threshold").as_double()});
-  return z;
-}
-
-bool PolarVoxelNoiseFilterComponent::is_voxel_noise_low_count(
-  int count, float int_avg, int ret_weak, const std::string & zone_name) const
-{
-  if (zone_name == "Near") {
-    return (count < voxel_noise_low_count_threshold_ && int_avg < voxel_noise_intensity_avg_threshold_) ||
-          (ret_weak > voxel_noise_ret_secondary_threshold_ && int_avg < voxel_noise_intensity_avg_threshold_);
-  } else if (zone_name == "Far") {
-    return (count < voxel_noise_low_count_threshold_ && int_avg < voxel_noise_intensity_avg_threshold_) ||
-         (ret_weak > voxel_noise_ret_secondary_threshold_ && int_avg < voxel_noise_intensity_avg_threshold_);
-  }
-  return false;
-}
-
-bool PolarVoxelNoiseFilterComponent::is_voxel_noise(
-  const VoxelMetrics & m, const std::string & zone_name) const
-{
-  if (zone_name == "Near") {
-    return m.count >= near_voxel_noise_count_min_ && m.count <= near_voxel_noise_count_max_ &&
-           m.int_avg < near_voxel_noise_int_avg_max_ && m.ent > near_voxel_noise_ent_min_ &&
-           m.anis < near_voxel_noise_anis_max_;
-  }
-  if (zone_name == "Far") {
-    return m.count >= far_voxel_noise_count_min_ && m.count <= far_voxel_noise_count_max_ &&
-           m.int_avg < far_voxel_noise_int_avg_max_ && m.ent > far_voxel_noise_ent_min_ &&
-           m.anis < far_voxel_noise_anis_max_;
-  }
-  return false;
-}
-
-int PolarVoxelNoiseFilterComponent::count_secondary_returns(int return_type) const
-{
-  return secondary_return_types_.count(return_type) ? 1 : 0;
-}
-
-int PolarVoxelNoiseFilterComponent::count_primary_returns(int return_type) const
-{
-  return std::find(primary_return_types_.begin(), primary_return_types_.end(), return_type) !=
-             primary_return_types_.end()
-           ? 1
-           : 0;
-}
-
-bool PolarVoxelNoiseFilterComponent::compute_metrics(
-  const std::vector<ZonePoint> & points, const std::vector<size_t> & indices,
-  VoxelMetrics & out) const
-{
-  const size_t n = indices.size();
-  if (n < 3) return false;
-
-  out.count = static_cast<int>(n);
-  float sum_i = 0.f;
-  int return_secondary = 0, return_primary = 0;
-  for (size_t i : indices) {
-    sum_i += points[i].intensity;
-    return_secondary += count_secondary_returns(points[i].return_type);
-    return_primary += count_primary_returns(points[i].return_type);
-  }
-  out.int_avg = sum_i / n;
-  out.ret_weak = return_secondary;
-  out.ret_strong = return_primary;
-  out.ret_ratio = return_primary > 0 ? static_cast<float>(return_secondary) / return_primary : 0.f;
-
-  Eigen::MatrixXf mat(static_cast<Eigen::Index>(n), 3);
-  for (size_t i = 0; i < n; ++i) {
-    const ZonePoint & p = points[indices[i]];
-    mat(static_cast<Eigen::Index>(i), 0) = p.x;
-    mat(static_cast<Eigen::Index>(i), 1) = p.y;
-    mat(static_cast<Eigen::Index>(i), 2) = p.z;
-  }
-  Eigen::Vector3f mean = mat.colwise().mean();
-  Eigen::MatrixXf centered = mat.rowwise() - mean.transpose();
-  Eigen::Matrix3f cov =
-    (centered.adjoint() * centered) / static_cast<float>(n - 1);
-
-  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
-  Eigen::Vector3f ev = es.eigenvalues();
-  float L1 = std::max(ev(2), 1e-9f);
-  float L2 = std::max(ev(1), 1e-9f);
-  float L3 = std::max(ev(0), 1e-9f);
-  float sum_ev = L1 + L2 + L3;
-
-  out.l1 = L1 / sum_ev;
-  out.l2 = L2 / sum_ev;
-  out.l3 = L3 / sum_ev;
-  out.lin = (L1 - L2) / L1;
-  out.plan = (L2 - L3) / L1;
-  out.anis = (L1 - L3) / L1;
-  out.curv = L3 / sum_ev;
-  out.sum_e = sum_ev;
-
-  float p1 = out.l1, p2 = out.l2, p3 = out.l3;
-  out.ent = 0.f;
-  if (p1 > 0.f) out.ent -= p1 * std::log(p1);
-  if (p2 > 0.f) out.ent -= p2 * std::log(p2);
-  if (p3 > 0.f) out.ent -= p3 * std::log(p3);
-  const float log3 = 1.0986122886681098f;
-  out.ent /= log3;
-
-  return true;
-}
-
-void PolarVoxelNoiseFilterComponent::filter_with_near_far_zones(
-  const PointCloud2 & input, PointCloud2 & output, ValidPointsMask & out_valid_mask)
-{
+  // Create iterators for cartesian coordinates (always exist for cartesian format)
   sensor_msgs::PointCloud2ConstIterator<float> iter_x(input, "x");
   sensor_msgs::PointCloud2ConstIterator<float> iter_y(input, "y");
   sensor_msgs::PointCloud2ConstIterator<float> iter_z(input, "z");
-  sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_int(input, "intensity");
-  sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_ret(input, "return_type");
+  sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_intensity(input, "intensity");
+  sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_return_type(input, "return_type");
 
-  std::vector<ZonePoint> all_points;
-  all_points.reserve(input.height * input.width);
-
-  for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z, ++iter_int, ++iter_ret) {
-    ZonePoint p;
-    p.x = *iter_x;
-    p.y = *iter_y;
-    p.z = *iter_z;
-    p.intensity = static_cast<float>(*iter_int);
-    p.return_type = static_cast<int>(*iter_ret);
-    all_points.push_back(p);
+  for (; iter_x != iter_x.end();
+       ++iter_x, ++iter_y, ++iter_z, ++iter_intensity, ++iter_return_type) {
+    point_voxel_info.emplace_back(
+      process_cartesian_point(*iter_x, *iter_y, *iter_z, *iter_intensity, *iter_return_type));
   }
-
-  if (all_points.empty()) {
-    out_valid_mask.clear();
-    create_empty_output(input, output);
-    return;
-  }
-
-  const size_t n = all_points.size();
-  out_valid_mask.assign(n, true);
-
-  for (const Zone & zone : zones_) {
-    std::vector<size_t> in_zone;
-    in_zone.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-      const ZonePoint & p = all_points[i];
-      const double rho = std::sqrt(static_cast<double>(p.x * p.x + p.y * p.y));
-      if (rho < zone.r_min || rho > zone.r_max) continue;
-      if (p.z < zone.z_min || p.z > zone.z_max) continue;
-      in_zone.push_back(i);
-    }
-
-    if (in_zone.empty()) continue;
-
-    const double r_min = zone.r_min;
-    const int max_z =
-      std::max(1, static_cast<int>((zone.z_max - zone.z_min) / zone.z_step) + 1);
-
-    using Key = std::array<int, 3>;
-    std::map<Key, std::vector<size_t>> voxels;
-
-    for (size_t idx : in_zone) {
-      const ZonePoint & p = all_points[idx];
-      const double rho = std::sqrt(static_cast<double>(p.x * p.x + p.y * p.y));
-      const double phi = std::atan2(p.y, p.x);
-      const int r_idx = static_cast<int>((rho - r_min) / zone.r_step);
-      const int az_idx = static_cast<int>((phi + M_PI) / zone.az_step);
-      int z_idx = static_cast<int>((p.z - zone.z_min) / zone.z_step);
-      z_idx = std::clamp(z_idx, 0, max_z - 1);
-      const Key k = {{r_idx, az_idx, z_idx}};
-      voxels[k].push_back(idx);
-    }
-
-    for (const auto & [key, indices] : voxels) {
-      (void)key;
-      float int_avg = 0.f;
-      int ret_weak = 0;
-      for (size_t i : indices) {
-        int_avg += all_points[i].intensity;
-        ret_weak += count_secondary_returns(all_points[i].return_type);
-      }
-      int_avg /= static_cast<float>(indices.size());
-      const int count = static_cast<int>(indices.size());
-
-      if (is_voxel_noise_low_count(count, int_avg, ret_weak, zone.name)) {
-        for (size_t i : indices) out_valid_mask[i] = false;
-        continue;
-      }
-
-      VoxelMetrics metrics;
-      if (!compute_metrics(all_points, indices, metrics)) {
-        continue;
-      }
-      if (is_voxel_noise(metrics, zone.name)) {
-        for (size_t i : indices) out_valid_mask[i] = false;
-      }
-    }
-  }
-
-  create_filtered_output(input, out_valid_mask, output);
 }
 
+std::optional<PointVoxelInfo> PolarVoxelNoiseFilterComponent::process_polar_point(
+  float distance, float azimuth, float elevation, uint8_t intensity, uint8_t return_type) const
+{
+  // Step 1: Extract polar coordinates and determine point classification
+  auto polar_opt = extract_polar_from_dae(distance, azimuth, elevation);
+  bool is_primary = is_point_primary(return_type);
+
+  // Step 2: Early return on invalid coordinates
+  if (!polar_opt.has_value()) {
+    return std::nullopt;
+  }
+
+  // Step 3: Create voxel index and determine point classification
+  PolarVoxelIndex voxel_idx = polar_to_polar_voxel(*polar_opt);
+
+  return PointVoxelInfo{voxel_idx, is_primary, intensity};
+}
+
+std::optional<PointVoxelInfo> PolarVoxelNoiseFilterComponent::process_cartesian_point(
+  float x, float y, float z, uint8_t intensity, uint8_t return_type) const
+{
+  auto polar_opt = extract_polar_from_xyz(x, y, z);
+
+  if (!polar_opt.has_value()) {
+    return std::nullopt;
+  }
+
+  return process_polar_point(
+    polar_opt->radius, polar_opt->azimuth, polar_opt->elevation, intensity, return_type);
+}
+
+template <typename Predicate>
+PolarVoxelNoiseFilterComponent::VoxelIndexSet
+PolarVoxelNoiseFilterComponent::determine_valid_voxels_generic(
+  const VoxelStatsMap & voxel_stats_map, Predicate predicate) const
+{
+  VoxelIndexSet valid_voxels;
+  for (const auto & [voxel_idx, stats] : voxel_stats_map) {
+    if (predicate(stats)) {
+      valid_voxels.insert(voxel_idx);
+    }
+  }
+  return valid_voxels;
+}
+
+bool PolarVoxelNoiseFilterComponent::is_point_primary(uint8_t return_type) const
+{
+  if (!use_return_type_classification_) {
+    return true;  // Treat all as primary in simple mode
+  }
+  auto it = std::find(
+    primary_return_types_.begin(), primary_return_types_.end(), static_cast<int>(return_type));
+  return it != primary_return_types_.end();
+}
 
 PolarVoxelNoiseFilterComponent::ValidPointsMask
 PolarVoxelNoiseFilterComponent::create_valid_points_mask(
@@ -551,22 +423,31 @@ bool PolarVoxelNoiseFilterComponent::has_sufficient_radius(const PolarCoordinate
   return std::abs(polar.radius) >= std::numeric_limits<double>::epsilon();
 }
 
-PolarVoxelNoiseFilterComponent::VoxelPointCountMap
-PolarVoxelNoiseFilterComponent::count_voxel_points(
+PolarVoxelNoiseFilterComponent::VoxelStatsMap
+PolarVoxelNoiseFilterComponent::analyze_voxel_stats(
   const PointVoxelInfoVector & point_voxel_info) const
 {
-  VoxelPointCountMap voxel_point_counts;
+  VoxelStatsMap voxel_stats_map;
   for (const auto & info_opt : point_voxel_info) {
     if (info_opt.has_value()) {
       const auto & info = info_opt.value();
-      if (info.is_primary) {
-        voxel_point_counts[info.voxel_idx].primary_count++;
-      } else if (info.meets_intensity_threshold) {
-        voxel_point_counts[info.voxel_idx].secondary_count++;
+      auto & voxel_stats = voxel_stats_map[info.voxel_idx];
+      voxel_stats.point_count++;
+      voxel_stats.intensity_sum += static_cast<float>(info.intensity);
+      if (use_return_type_classification_ && !info.is_primary) {
+        voxel_stats.secondary_return_count++;
       }
     }
   }
-  return voxel_point_counts;
+
+  // Calculate intensity average per voxel
+  for (auto & [voxel_idx, voxel_stats] : voxel_stats_map) {
+    (void)voxel_idx;
+    if (voxel_stats.point_count > 0) {
+      voxel_stats.intensity_avg = voxel_stats.intensity_sum / voxel_stats.point_count;
+    }
+  }
+  return voxel_stats_map;
 }
 
 void PolarVoxelNoiseFilterComponent::update_parameter(const rclcpp::Parameter & param)
@@ -590,58 +471,16 @@ void PolarVoxelNoiseFilterComponent::update_parameter(const rclcpp::Parameter & 
      [this](const auto & p) { secondary_noise_threshold_ = static_cast<int>(p.as_int()); }},
     {"intensity_threshold",
      [this](const auto & p) { intensity_threshold_ = static_cast<int>(p.as_int()); }},
+    {"avg_intensity_threshold",
+     [this](const auto & p) { avg_intensity_threshold_ = p.as_double(); }},
     {"min_radius_m", [this](const auto & p) { min_radius_m_ = p.as_double(); }},
     {"max_radius_m", [this](const auto & p) { max_radius_m_ = p.as_double(); }},
-    {"voxel_noise_low_count_threshold",
-     [this](const auto & p) { voxel_noise_low_count_threshold_ = static_cast<int>(p.as_int()); }},
-    {"voxel_noise_intensity_avg_threshold",
-     [this](const auto & p) { voxel_noise_intensity_avg_threshold_ = static_cast<float>(p.as_double()); }},
-    {"voxel_noise_ret_secondary_threshold",
-     [this](const auto & p) { voxel_noise_ret_secondary_threshold_ = static_cast<int>(p.as_int()); }},
-    {"near_voxel_noise_count_min",
-     [this](const auto & p) { near_voxel_noise_count_min_ = static_cast<int>(p.as_int()); }},
-    {"near_voxel_noise_count_max",
-     [this](const auto & p) { near_voxel_noise_count_max_ = static_cast<int>(p.as_int()); }},
-    {"near_voxel_noise_int_avg_max",
-     [this](const auto & p) { near_voxel_noise_int_avg_max_ = static_cast<float>(p.as_double()); }},
-    {"near_voxel_noise_ent_min",
-     [this](const auto & p) { near_voxel_noise_ent_min_ = static_cast<float>(p.as_double()); }},
-    {"near_voxel_noise_anis_max",
-     [this](const auto & p) { near_voxel_noise_anis_max_ = static_cast<float>(p.as_double()); }},
-    {"far_voxel_noise_count_min",
-     [this](const auto & p) { far_voxel_noise_count_min_ = static_cast<int>(p.as_int()); }},
-    {"far_voxel_noise_count_max",
-     [this](const auto & p) { far_voxel_noise_count_max_ = static_cast<int>(p.as_int()); }},
-    {"far_voxel_noise_int_avg_max",
-     [this](const auto & p) { far_voxel_noise_int_avg_max_ = static_cast<float>(p.as_double()); }},
-    {"far_voxel_noise_ent_min",
-     [this](const auto & p) { far_voxel_noise_ent_min_ = static_cast<float>(p.as_double()); }},
-    {"far_voxel_noise_anis_max",
-     [this](const auto & p) { far_voxel_noise_anis_max_ = static_cast<float>(p.as_double()); }},
     {"use_return_type_classification",
      [this](const auto & p) { use_return_type_classification_ = p.as_bool(); }},
     {"filter_secondary_returns",
      [this](const auto & p) { enable_secondary_return_filtering_ = p.as_bool(); }},
     {"primary_return_types", [this](const auto & p) { update_primary_return_types(p); }},
-    {"publish_noise_cloud", [this](const auto & p) { update_publish_noise_cloud(p); }},
-    {"use_near_far_zones", [this](const auto & p) { use_near_far_zones_ = p.as_bool(); }},
-    {"secondary_return_types", [this](const auto & p) { update_secondary_return_types(p); }},
-    {"near_radius_min", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"near_radius_max", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"near_z_min", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"near_z_max", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"near_radius_step", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"near_azimuth_step", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"near_z_step", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"near_intensity_threshold", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"far_radius_min", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"far_radius_max", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"far_z_min", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"far_z_max", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"far_radius_step", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"far_azimuth_step", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"far_z_step", [this](const auto &) { zones_ = build_zones_from_params(); }},
-    {"far_intensity_threshold", [this](const auto &) { zones_ = build_zones_from_params(); }}};
+    {"publish_noise_cloud", [this](const auto & p) { update_publish_noise_cloud(p); }}};
 
   const auto & name = param.get_name();
   auto it = parameter_updaters.find(name);
@@ -683,45 +522,50 @@ void PolarVoxelNoiseFilterComponent::update_publish_noise_cloud(const rclcpp::Pa
   }
 }
 
-void PolarVoxelNoiseFilterComponent::update_secondary_return_types(const rclcpp::Parameter &)
+PolarVoxelNoiseFilterComponent::VoxelIndexSet
+PolarVoxelNoiseFilterComponent::determine_valid_voxels(
+  const VoxelStatsMap & voxel_stats_map) const
 {
-  secondary_return_types_.clear();
-  for (int64_t v : this->get_parameter("secondary_return_types").as_integer_array()) {
-    secondary_return_types_.insert(static_cast<int>(v));
+  if (use_return_type_classification_) {
+    return determine_valid_voxels_with_return_types(voxel_stats_map);
+  } else {
+    return determine_valid_voxels_simple(voxel_stats_map);
   }
 }
 
-// PolarVoxelNoiseFilterComponent::VoxelIndexSet
-// PolarVoxelNoiseFilterComponent::determine_valid_voxels(
-//   const VoxelPointCountMap & voxel_point_counts) const
-// {
-//   if (use_return_type_classification_) {
-//     return determine_valid_voxels_with_return_types(voxel_point_counts);
-//   } else {
-//     return determine_valid_voxels_simple(voxel_point_counts);
-//   }
-// }
+PolarVoxelNoiseFilterComponent::VoxelIndexSet
+PolarVoxelNoiseFilterComponent::determine_valid_voxels_simple(
+  const VoxelStatsMap & voxel_stats_map) const
+{
+  return determine_valid_voxels_generic(
+    voxel_stats_map, [this](const VoxelStats & stats) {
+      return !stats.meets_noise_simple_condition(voxel_points_threshold_, avg_intensity_threshold_);
+      // return stats.meets_min_points(voxel_points_threshold_) &&
+      //        stats.meets_max_intensity_avg(intensity_threshold_);
+    });
+}
+
+PolarVoxelNoiseFilterComponent::VoxelIndexSet
+PolarVoxelNoiseFilterComponent::determine_valid_voxels_with_return_types(
+  const VoxelStatsMap & voxel_stats_map) const
+{
+  return determine_valid_voxels_generic(
+    voxel_stats_map, [this](const VoxelStats & stats) {
+      if (stats.meets_noise_condition(voxel_points_threshold_, avg_intensity_threshold_, secondary_noise_threshold_)) {
+        return false;
+      } else {
+        return true;
+      }
+    });
+}
 
 // PolarVoxelNoiseFilterComponent::VoxelIndexSet
-// PolarVoxelNoiseFilterComponent::determine_valid_voxels_simple(
-//   const VoxelPointCountMap & voxel_point_counts) const
+// PolarVoxelNoiseFilterComponent::meets_noise_condition(
+//   const VoxelStats & stats) const
 // {
-//   return determine_valid_voxels_generic(
-//     voxel_point_counts, [this](const VoxelPointCounts & counts) {
-//       size_t total = counts.primary_count + counts.secondary_count;
-//       return total >= static_cast<size_t>(voxel_points_threshold_);
-//     });
-// }
-
-// PolarVoxelNoiseFilterComponent::VoxelIndexSet
-// PolarVoxelNoiseFilterComponent::determine_valid_voxels_with_return_types(
-//   const VoxelPointCountMap & voxel_point_counts) const
-// {
-//   return determine_valid_voxels_generic(
-//     voxel_point_counts, [this](const VoxelPointCounts & counts) {
-//       return counts.meets_primary_threshold(voxel_points_threshold_) &&
-//              counts.meets_secondary_threshold(secondary_noise_threshold_);
-//     });
+//   return (stats.point_count <= voxel_points_threshold_  && 
+//           stats.intensity_avg <= avg_intensity_threshold_) ||
+//          (stats.secondary_return_count >= secondary_noise_threshold_);
 // }
 
 void PolarVoxelNoiseFilterComponent::setup_output_header(
@@ -812,6 +656,28 @@ bool PolarVoxelNoiseFilterComponent::validate_normalized(
   return true;
 }
 
+bool PolarVoxelNoiseFilterComponent::validate_zero_to_two_pi(
+  const rclcpp::Parameter & param, std::string & reason)
+{
+  double val = param.as_double();
+  if (val < 0.0 || val > TWO_PI) {
+    reason = param.get_name() + " must be between 0.0 and 2*PI";
+    return false;
+  }
+  return true;
+}
+
+bool PolarVoxelNoiseFilterComponent::validate_negative_half_pi_to_half_pi(
+  const rclcpp::Parameter & param, std::string & reason)
+{
+  double val = param.as_double();
+  if (val < -M_PI / 2.0 || val > M_PI / 2.0) {
+    reason = param.get_name() + " must be between -PI and PI";
+    return false;
+  }
+  return true;
+}
+
 rcl_interfaces::msg::SetParametersResult PolarVoxelNoiseFilterComponent::param_callback(
   const std::vector<rclcpp::Parameter> & params)
 {
@@ -849,59 +715,6 @@ rcl_interfaces::msg::SetParametersResult PolarVoxelNoiseFilterComponent::param_c
     {"intensity_threshold",
      {validate_intensity_threshold,
       [this](const rclcpp::Parameter & p) { intensity_threshold_ = p.as_int(); }}},
-    {"voxel_noise_low_count_threshold",
-     {validate_non_negative_int,
-      [this](const rclcpp::Parameter & p) { voxel_noise_low_count_threshold_ = p.as_int(); }}},
-    {"voxel_noise_intensity_avg_threshold",
-     {validate_non_negative_double,
-      [this](const rclcpp::Parameter & p) {
-        voxel_noise_intensity_avg_threshold_ = static_cast<float>(p.as_double());
-      }}},
-    {"voxel_noise_ret_secondary_threshold",
-     {validate_non_negative_int,
-      [this](const rclcpp::Parameter & p) { voxel_noise_ret_secondary_threshold_ = p.as_int(); }}},
-    {"near_voxel_noise_count_min",
-     {validate_non_negative_int,
-      [this](const rclcpp::Parameter & p) { near_voxel_noise_count_min_ = p.as_int(); }}},
-    {"near_voxel_noise_count_max",
-     {validate_non_negative_int,
-      [this](const rclcpp::Parameter & p) { near_voxel_noise_count_max_ = p.as_int(); }}},
-    {"near_voxel_noise_int_avg_max",
-     {validate_non_negative_double,
-      [this](const rclcpp::Parameter & p) {
-        near_voxel_noise_int_avg_max_ = static_cast<float>(p.as_double());
-      }}},
-    {"near_voxel_noise_ent_min",
-     {validate_non_negative_double,
-      [this](const rclcpp::Parameter & p) {
-        near_voxel_noise_ent_min_ = static_cast<float>(p.as_double());
-      }}},
-    {"near_voxel_noise_anis_max",
-     {validate_normalized,
-      [this](const rclcpp::Parameter & p) {
-        near_voxel_noise_anis_max_ = static_cast<float>(p.as_double());
-      }}},
-    {"far_voxel_noise_count_min",
-     {validate_non_negative_int,
-      [this](const rclcpp::Parameter & p) { far_voxel_noise_count_min_ = p.as_int(); }}},
-    {"far_voxel_noise_count_max",
-     {validate_non_negative_int,
-      [this](const rclcpp::Parameter & p) { far_voxel_noise_count_max_ = p.as_int(); }}},
-    {"far_voxel_noise_int_avg_max",
-     {validate_non_negative_double,
-      [this](const rclcpp::Parameter & p) {
-        far_voxel_noise_int_avg_max_ = static_cast<float>(p.as_double());
-      }}},
-    {"far_voxel_noise_ent_min",
-     {validate_non_negative_double,
-      [this](const rclcpp::Parameter & p) {
-        far_voxel_noise_ent_min_ = static_cast<float>(p.as_double());
-      }}},
-    {"far_voxel_noise_anis_max",
-     {validate_normalized,
-      [this](const rclcpp::Parameter & p) {
-        far_voxel_noise_anis_max_ = static_cast<float>(p.as_double());
-      }}},
     {"use_return_type_classification",
      {nullptr,
       [this](const rclcpp::Parameter & p) { use_return_type_classification_ = p.as_bool(); }}},
@@ -920,28 +733,7 @@ rcl_interfaces::msg::SetParametersResult PolarVoxelNoiseFilterComponent::param_c
         for (auto v : arr) primary_return_types_.push_back(static_cast<int>(v));
       }}},
     {"publish_noise_cloud",
-     {nullptr, [this](const rclcpp::Parameter & p) { publish_noise_cloud_ = p.as_bool(); }}},
-    {"use_near_far_zones",
-     {nullptr, [this](const rclcpp::Parameter & p) { use_near_far_zones_ = p.as_bool(); }}},
-    {"secondary_return_types",
-     {validate_primary_return_types,
-      [this](const rclcpp::Parameter & p) { update_secondary_return_types(p); }}},
-    {"near_radius_min", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"near_radi_max", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"near_z_min", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"near_z_max", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"near_radius_step", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"near_azimuth_step", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"near_z_step", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"near_intensity_threshold", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"far_radius_min", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"far_radius_max", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"far_z_min", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"far_z_max", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"far_radius_step", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"far_azimuth_step", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"far_z_step", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}},
-    {"far_intensity_threshold", {nullptr, [this](const rclcpp::Parameter &) { zones_ = build_zones_from_params(); }}}};
+     {nullptr, [this](const rclcpp::Parameter & p) { publish_noise_cloud_ = p.as_bool(); }}}};
 
   for (const auto & param : params) {
     auto it = param_ops.find(param.get_name());
@@ -960,7 +752,6 @@ rcl_interfaces::msg::SetParametersResult PolarVoxelNoiseFilterComponent::param_c
 
   return result;
 }
-
 
 void PolarVoxelNoiseFilterComponent::validate_filter_inputs(
   const PointCloud2 & input, const IndicesPtr & indices)

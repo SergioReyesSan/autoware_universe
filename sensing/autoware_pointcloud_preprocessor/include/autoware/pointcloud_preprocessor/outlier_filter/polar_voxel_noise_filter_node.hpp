@@ -15,19 +15,20 @@
 #ifndef AUTOWARE__POINTCLOUD_PREPROCESSOR__OUTLIER_FILTER__POLAR_VOXEL_NOISE_FILTER_NODE_HPP_
 #define AUTOWARE__POINTCLOUD_PREPROCESSOR__OUTLIER_FILTER__POLAR_VOXEL_NOISE_FILTER_NODE_HPP_
 
+#include "autoware/pointcloud_preprocessor/diagnostics/hysteresis_state_machine.hpp"
 #include "autoware/pointcloud_preprocessor/filter.hpp"
 
+#include <diagnostic_updater/diagnostic_updater.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include <autoware_internal_debug_msgs/msg/float32_stamped.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 
-#include <array>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -35,39 +36,6 @@
 
 namespace autoware::pointcloud_preprocessor
 {
-
-// Zone definition for near/far geometric noise filter (r, azimuth, z voxelization)
-struct Zone
-{
-  std::string name;
-  double r_min{};
-  double r_max{};
-  double z_min{};
-  double z_max{};
-  double r_step{};
-  double az_step{};
-  double z_step{};
-  double intensity_threshold{};
-};
-
-// Voxel geometric metrics (eigenvalue-based) for noise classification
-struct VoxelMetrics
-{
-  float lin{0.f};
-  float plan{0.f};
-  float ent{0.f};
-  float anis{0.f};
-  float curv{0.f};
-  float l1{0.f};
-  float l2{0.f};
-  float l3{0.f};
-  float sum_e{0.f};
-  int count{0};
-  float int_avg{0.f};
-  int ret_weak{0};
-  int ret_strong{0};
-  float ret_ratio{0.f};
-};
 
 // Polar voxel index for 3D polar coordinate space discretization
 struct PolarVoxelIndex
@@ -109,33 +77,49 @@ struct PointVoxelInfo
 {
   PolarVoxelIndex voxel_idx;
   bool is_primary{false};
-  bool meets_intensity_threshold{false};
+  uint8_t intensity{0U};
 
   PointVoxelInfo() = default;
-  explicit PointVoxelInfo(
-    const PolarVoxelIndex & voxel_idx, bool is_primary, bool meets_intensity_threshold)
+  PointVoxelInfo(const PolarVoxelIndex & voxel_idx, bool is_primary, uint8_t intensity)
   : voxel_idx(voxel_idx),
     is_primary(is_primary),
-    meets_intensity_threshold(meets_intensity_threshold)
+    intensity(intensity)
   {
   }
 };
 
-// Count statistics for points within a voxel
-struct VoxelPointCounts
+// Aggregated statistics for points within a voxel
+struct VoxelStats
 {
-  size_t primary_count{0};
-  size_t secondary_count{0};
+  int point_count{0};
+  float intensity_sum{0.0f};
+  float intensity_avg{0.0f};
+  int secondary_return_count{0};
 
-  // Threshold checks (inclusive)
-  [[nodiscard]] bool meets_primary_threshold(int threshold) const
+  [[nodiscard]] bool meets_min_points(int threshold) const
   {
-    return primary_count >= static_cast<size_t>(threshold);
+    return point_count >= threshold;
   }
 
-  [[nodiscard]] bool meets_secondary_threshold(int threshold) const
+  [[nodiscard]] bool meets_max_intensity_avg(int threshold) const
   {
-    return secondary_count <= static_cast<size_t>(threshold);
+    return intensity_avg <= static_cast<float>(threshold);
+  }
+
+  [[nodiscard]] bool meets_max_secondary_returns(int threshold) const
+  {
+    return secondary_return_count <= threshold;
+  }
+  [[nodiscard]] bool meets_noise_condition(int min_points,  
+                          float avg_intensity_threshold, int max_secondary_returns) const
+  {
+    return (point_count <= min_points && intensity_avg <= avg_intensity_threshold) 
+            || (secondary_return_count >= max_secondary_returns && intensity_avg <= avg_intensity_threshold);
+  }
+  [[nodiscard]] bool meets_noise_simple_condition(int min_points,  
+    float avg_intensity_threshold) const
+  {
+    return (point_count <= min_points && intensity_avg <= avg_intensity_threshold);
   }
 };
 
@@ -170,14 +154,12 @@ protected:
   // Parameter update helper methods
   void update_primary_return_types(const rclcpp::Parameter & param);
   void update_publish_noise_cloud(const rclcpp::Parameter & param);
-  void update_secondary_return_types(const rclcpp::Parameter & param);
 
   // Type aliases to eliminate long type name duplication
   using PointCloud2 = sensor_msgs::msg::PointCloud2;
   using PointCloud2ConstPtr = sensor_msgs::msg::PointCloud2::ConstSharedPtr;
   using IndicesPtr = pcl::IndicesPtr;
-  using VoxelPointCountMap =
-    std::unordered_map<PolarVoxelIndex, VoxelPointCounts, PolarVoxelIndexHash>;
+  using VoxelStatsMap = std::unordered_map<PolarVoxelIndex, VoxelStats, PolarVoxelIndexHash>;
   using VoxelIndexSet = std::unordered_set<PolarVoxelIndex, PolarVoxelIndexHash>;
   using PointVoxelInfoVector = std::vector<std::optional<PointVoxelInfo>>;
   using ValidPointsMask = std::vector<bool>;
@@ -185,39 +167,21 @@ protected:
   void filter(
     const PointCloud2ConstPtr & input, const IndicesPtr & indices, PointCloud2 & output) override;
 
-  // Near/far zones pipeline (r, azimuth, z voxelization + Eigen metrics)
-  void filter_with_near_far_zones(
-    const PointCloud2 & input, PointCloud2 & output, ValidPointsMask & out_valid_mask);
-
-  struct ZonePoint
-  {
-    float x{};
-    float y{};
-    float z{};
-    float intensity{};
-    int return_type{};
-  };
-  bool is_voxel_noise_low_count(
-    int count, float int_avg, int ret_weak, const std::string & zone_name) const;
-  bool is_voxel_noise(const VoxelMetrics & m, const std::string & zone_name) const;
-  bool compute_metrics(
-    const std::vector<ZonePoint> & points, const std::vector<size_t> & indices,
-    VoxelMetrics & out) const;
-  int count_secondary_returns(int return_type) const;
-  int count_primary_returns(int return_type) const;
-
   PointVoxelInfoVector collect_voxel_info(const PointCloud2 & input);
-  VoxelPointCountMap count_voxel_points(const PointVoxelInfoVector & point_voxel_info) const;
-  VoxelIndexSet determine_valid_voxels_simple(const VoxelPointCountMap & voxel_point_counts) const;
+  VoxelStatsMap analyze_voxel_stats(const PointVoxelInfoVector & point_voxel_info) const;
+  VoxelIndexSet determine_valid_voxels_simple(const VoxelStatsMap & voxel_stats_map) const;
   VoxelIndexSet determine_valid_voxels_with_return_types(
-    const VoxelPointCountMap & voxel_point_counts) const;
-  VoxelIndexSet determine_valid_voxels(const VoxelPointCountMap & voxel_point_counts) const;
+    const VoxelStatsMap & voxel_stats_map) const;
+  VoxelIndexSet determine_valid_voxels(const VoxelStatsMap & voxel_stats_map) const;
   ValidPointsMask create_valid_points_mask(
     const PointVoxelInfoVector & point_voxel_info, const VoxelIndexSet & valid_voxels) const;
-  void create_filtered_output(
+  static void create_filtered_output(
     const PointCloud2 & input, const ValidPointsMask & valid_points_mask, PointCloud2 & output);
   void publish_noise_cloud(
     const PointCloud2 & input, const ValidPointsMask & valid_points_mask) const;
+  void publish_diagnostics(
+    const VoxelStatsMap & voxel_stats_map, const ValidPointsMask & valid_points_mask);
+
   // Point processing helper methods
   void process_polar_points(const PointCloud2 & input, PointVoxelInfoVector & point_voxel_info);
 
@@ -231,7 +195,7 @@ protected:
 
   template <typename Predicate>
   VoxelIndexSet determine_valid_voxels_generic(
-    const VoxelPointCountMap & voxel_point_counts, Predicate predicate) const;
+    const VoxelStatsMap & voxel_stats_map, Predicate predicate) const;
 
   std::optional<PolarCoordinate> extract_polar_from_dae(
     float distance, float azimuth, float elevation) const;
@@ -251,11 +215,16 @@ protected:
   // Return type and validation methods
   bool is_point_primary(uint8_t return_type) const;
   bool is_valid_polar_point(const PolarCoordinate & polar) const;
-  bool meets_intensity_threshold(uint8_t intensity) const;
   static bool has_polar_coordinates(const PointCloud2 & input);
 
-  // Parameter callback
+  // Parameter callback and diagnostics
   rcl_interfaces::msg::SetParametersResult param_callback(const std::vector<rclcpp::Parameter> & p);
+
+  // Constants to handle circular angles
+  const double azimuth_domain_min;
+  const double azimuth_domain_max;
+  const double elevation_domain_min;
+  const double elevation_domain_max;
 
   // Parameters
   double radial_resolution_m_{};
@@ -268,35 +237,12 @@ protected:
   bool enable_secondary_return_filtering_{};
   int secondary_noise_threshold_{};
   int intensity_threshold_{};
+  double avg_intensity_threshold_{};
   std::vector<int> primary_return_types_;
   bool publish_noise_cloud_{};
-
-  // Near/far zones geometric noise filter (from voxel_filter_rules)
-  bool use_near_far_zones_{false};
-  std::set<int> secondary_return_types_;
-  std::vector<Zone> zones_;
-
-  // is_voxel_noise_low_count parameters: (count < count_threshold && int_avg < intensity_avg_threshold)
-  // || (ret_secondary > ret_secondary_threshold && int_avg < intensity_avg_threshold)
-  int voxel_noise_low_count_threshold_{5};
-  float voxel_noise_intensity_avg_threshold_{0.01f};
-  int voxel_noise_ret_secondary_threshold_{5};
-
-  // is_voxel_noise parameters per zone: (count >= count_min && count <= count_max && int_avg < int_avg_max && ent > ent_min && anis < anis_max)
-  int near_voxel_noise_count_min_{5};
-  int near_voxel_noise_count_max_{20};
-  float near_voxel_noise_int_avg_max_{0.01f};
-  float near_voxel_noise_ent_min_{0.1f};
-  float near_voxel_noise_anis_max_{0.995f};
-  int far_voxel_noise_count_min_{7};
-  int far_voxel_noise_count_max_{25};
-  float far_voxel_noise_int_avg_max_{0.01f};
-  float far_voxel_noise_ent_min_{0.1f};
-  float far_voxel_noise_anis_max_{0.995f};
-
   std::mutex mutex_;
 
-  // Publishers
+  // Publishers and diagnostics
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr noise_cloud_pub_;
   OnSetParametersCallbackHandle::SharedPtr set_param_res_;
 
@@ -318,8 +264,6 @@ protected:
 
 private:
   using ParamHandler = std::function<bool(const rclcpp::Parameter &, std::string &)>;
-  void declare_zone_parameters();
-  std::vector<Zone> build_zones_from_params() const;
   // Validation helper methods
   void validate_indices(const IndicesPtr & indices);
   void validate_required_fields(const PointCloud2 & input);
@@ -335,6 +279,9 @@ private:
   static bool validate_intensity_threshold(const rclcpp::Parameter & param, std::string & reason);
   static bool validate_primary_return_types(const rclcpp::Parameter & param, std::string & reason);
   static bool validate_normalized(const rclcpp::Parameter & param, std::string & reason);
+  static bool validate_zero_to_two_pi(const rclcpp::Parameter & param, std::string & reason);
+  static bool validate_negative_half_pi_to_half_pi(
+    const rclcpp::Parameter & param, std::string & reason);
 };
 
 }  // namespace autoware::pointcloud_preprocessor
