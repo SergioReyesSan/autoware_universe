@@ -1,24 +1,65 @@
 /**:
   ros__parameters:
-    # Spatial filter (points outside are not considered for clustering)
-    r_min: 0.0
-    r_max: 40.0
-    z_min: -2.6
-    z_max: 2.0
-    intensity_threshold: 4.0
+    # Core filtering parameters
+    radial_resolution_m: 0.5                     # Resolution in radial direction (meters)
+    azimuth_resolution_rad: 0.0175               # Resolution in azimuth direction (radians)
+    elevation_resolution_rad: 0.0175              # Resolution in elevation direction (radians)
+    voxel_points_threshold: 2                     # Minimum points required per voxel
+    min_radius_m: 0.5                             # Minimum radius to consider (meters)
+    max_radius_m: 300.0                           # Maximum radius to consider (meters)
+    #intensity_threshold: 2                        # Maximum intensity threshold for secondary returns (primary returns are not affected)
 
-    # Euclidean clustering (grid-indexed)
-    cluster_eps: 0.7
-    cluster_min_pts: 7
-    z_scale: 5.0
+    # Return type classification parameters
+    use_return_type_classification: true         # Whether to use return type classification
+    filter_secondary_returns: false               # Whether to filter secondary returns (keep only primary when true)
+    secondary_noise_threshold: 4                 # Threshold for classifying primary vs secondary returns
+    primary_return_types: [1, 6, 8, 10]          # Return types considered as primary returns (all others are secondary)
 
-    # Cluster-based noise rules (entropy and weak return count)
-    entropy_noise_thresh: 0.3
-    weak_count_noise_thresh: 5
+    # Near/far zones geometric noise filter (voxel_filter_rules style)
+    use_near_far_zones: true                     # If true, use near/far zones with (r,az,z) voxelization and Eigen-based noise metrics
+    secondary_return_types: [3, 4, 5, 7, 9]      # Return type values classified as secondary (for noise classification in zones)
+    voxel_noise_low_count_threshold: 5            # Count threshold: voxel is noise if point count < this
+    voxel_noise_intensity_avg_threshold: 0.01     # Intensity threshold: voxel is noise if int_avg < this
+    voxel_noise_ret_secondary_threshold: 5         # Secondary return threshold for low-count noise
+    # is_voxel_noise thresholds (count range, int_avg, entropy, anisotropy) per zone
+    near_voxel_noise_count_min: 5
+    near_voxel_noise_count_max: 20
+    near_voxel_noise_int_avg_max: 0.01
+    near_voxel_noise_ent_min: 0.1
+    near_voxel_noise_anis_max: 0.995
+    far_voxel_noise_count_min: 7
+    far_voxel_noise_count_max: 25
+    far_voxel_noise_int_avg_max: 0.01
+    far_voxel_noise_ent_min: 0.1
+    far_voxel_noise_anis_max: 0.995
+    # Near zone (e.g. 0–20 m)
+    near_r_min: 0.0
+    near_r_max: 20.0
+    near_z_min: -10.0
+    near_z_max: 30.0
+    near_r_step: 0.6
+    near_az_step: 0.2
+    near_z_step: 0.6
+    near_intensity_threshold: 0.5
+    # Far zone (e.g. 20–80 m)
+    far_r_min: 20.0
+    far_r_max: 80.0
+    far_z_min: -10.0
+    far_z_max: 40.0
+    far_r_step: 0.6
+    far_az_step: 0.1
+    far_z_step: 0.6
+    far_intensity_threshold: 0.5
 
-    # Return type sets (weak returns often indicate noise)
-    return_weak_numbers: [2, 3, 4, 5, 7, 9]
-    return_strong_numbers: [1, 6, 8, 10]
+    # Performance and debug control
+    publish_noise_cloud: true                     # Generate and publish noise cloud for debugging
+    publish_ground_cloud: true                    # Generate and publish detected ground cloud for debugging
 
-    # Debug
-    publish_noise_cloud: true
+    # Ground and second refinement
+    run_ground_refinement: true                   # Enable polynomial refinement from ground seed voxels
+    run_second_refinement: false                   # Enable neighborhood-based second-pass voxel refinement
+    ground_refinement_distance_threshold: 0.2     # Max |z - z_pred| for refined ground inclusion (m)
+    ground_refinement_voxel_size: 0.3             # XY subsampling grid size for polynomial seed fitting (m)
+    ground_refinement_claim_ratio: 0.1            # Voxel promoted to ground if refined ground ratio exceeds this
+    second_refinement_radius: 1                   # Voxel-neighborhood radius for second refinement voting
+    intensity_threshold: 40
