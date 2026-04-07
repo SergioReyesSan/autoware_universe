@@ -131,7 +131,7 @@ PolarVoxelNoiseFilterComponent::PolarVoxelNoiseFilterComponent(
 
 void PolarVoxelNoiseFilterComponent::filter(
   const PointCloud2ConstPtr & input, const IndicesPtr & indices, PointCloud2 & output)
-{
+{  
   std::scoped_lock lock(mutex_);
 
   if (!input) {
@@ -540,8 +540,6 @@ PolarVoxelNoiseFilterComponent::determine_valid_voxels_simple(
   return determine_valid_voxels_generic(
     voxel_stats_map, [this](const VoxelStats & stats) {
       return !stats.meets_noise_simple_condition(voxel_points_threshold_, avg_intensity_threshold_);
-      // return stats.meets_min_points(voxel_points_threshold_) &&
-      //        stats.meets_max_intensity_avg(intensity_threshold_);
     });
 }
 
@@ -559,14 +557,6 @@ PolarVoxelNoiseFilterComponent::determine_valid_voxels_with_return_types(
     });
 }
 
-// PolarVoxelNoiseFilterComponent::VoxelIndexSet
-// PolarVoxelNoiseFilterComponent::meets_noise_condition(
-//   const VoxelStats & stats) const
-// {
-//   return (stats.point_count <= voxel_points_threshold_  && 
-//           stats.intensity_avg <= avg_intensity_threshold_) ||
-//          (stats.secondary_return_count >= secondary_noise_threshold_);
-// }
 
 void PolarVoxelNoiseFilterComponent::setup_output_header(
   PointCloud2 & output, const PointCloud2 & input, size_t valid_count)
