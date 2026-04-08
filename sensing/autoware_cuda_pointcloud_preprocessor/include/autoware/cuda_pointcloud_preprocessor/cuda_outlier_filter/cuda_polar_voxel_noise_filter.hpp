@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <tuple>
 #include <type_traits>
 #include <vector>
@@ -39,22 +40,75 @@ namespace autoware::cuda_pointcloud_preprocessor
 
 struct CudaPolarVoxelNoiseFilterParameters
 {
-  // Polar voxel parameters
-  double radial_resolution_m;                // Resolution in radial direction (meters)
-  double azimuth_resolution_rad;             // Resolution in azimuth direction (radians)
-  double elevation_resolution_rad;           // Resolution in elevation direction (radians)
-  int voxel_points_threshold;                // Minimum points required per voxel
-  double avg_intensity_threshold;            // Maximum average intensity per voxel (noise criterion)
-  double min_radius_m;                       // Minimum radius to consider
-  double max_radius_m;                       // Maximum radius to consider
+  // Polar voxel parameters (legacy simple mode)
+  double radial_resolution_m;      // Resolution in radial direction (meters)
+  double azimuth_resolution_rad;   // Resolution in azimuth direction (radians)
+  double elevation_resolution_rad; // Resolution in elevation direction (radians)
+  int voxel_points_threshold;      // Minimum points required per voxel
+  double avg_intensity_threshold;  // Maximum average intensity per voxel (noise criterion)
+  double min_radius_m;             // Minimum radius to consider
+  double max_radius_m;             // Maximum radius to consider
 
   // Return type classification parameters
   bool use_return_type_classification;  // Whether to use return type classification
   bool filter_secondary_returns;        // Whether to filter secondary returns
   int secondary_noise_threshold;        // Threshold for primary to secondary return classification
-  int intensity_threshold;              // Maximum intensity for secondary returns
+  int intensity_threshold;              // Point-level intensity threshold (uint8_t domain)
 
-  bool publish_noise_cloud;  // Generate and publish noise cloud for debugging
+  // Near/far zones geometric noise filter (CPU parity mode)
+  bool use_near_far_zones{false};
+
+  // Zone bounds/voxelization + zone-level intensity gating
+  double near_radius_min{0.0};
+  double near_radius_max{20.0};
+  double near_z_min{-10.0};
+  double near_z_max{10.0};
+  double near_radius_step{0.6};
+  double near_azimuth_step{0.1};
+  double near_z_step{0.6};
+  double near_intensity_threshold{0.5};
+
+  double far_radius_min{20.0};
+  double far_radius_max{60.0};
+  double far_z_min{-10.0};
+  double far_z_max{10.0};
+  double far_radius_step{0.6};
+  double far_azimuth_step{0.1};
+  double far_z_step{0.6};
+  double far_intensity_threshold{0.5};
+
+  // Low-count/intensity heuristic (used as early category)
+  int voxel_noise_low_count_threshold{5};
+  double voxel_noise_intensity_avg_threshold{0.01};
+  int voxel_noise_ret_secondary_threshold{5};
+
+  // is_voxel_noise thresholds per zone (count, int_avg, ent, anis)
+  int near_voxel_noise_count_min{5};
+  int near_voxel_noise_count_max{20};
+  double near_voxel_noise_int_avg_max{0.01};
+  double near_voxel_noise_ent_min{0.1};
+  double near_voxel_noise_anis_max{0.995};
+
+  int far_voxel_noise_count_min{7};
+  int far_voxel_noise_count_max{25};
+  double far_voxel_noise_int_avg_max{0.01};
+  double far_voxel_noise_ent_min{0.1};
+  double far_voxel_noise_anis_max{0.995};
+
+  // Optional refinement passes (CPU parity mode)
+  bool run_ground_refinement{true};
+  bool run_second_refinement{true};
+  double ground_refinement_distance_threshold{0.2};
+  double ground_refinement_voxel_size{0.3};
+  double ground_refinement_claim_ratio{0.1};
+  int second_refinement_radius{1};
+
+  // CPU-parity secondary return classification set
+  std::vector<int> secondary_return_types{};
+
+  // Debug output toggles
+  bool publish_noise_cloud;   // Generate and publish noise cloud for debugging
+  bool publish_ground_cloud{true};
 };
 
 // Helper struct to make passing data to CUDA Kernel easy
@@ -147,6 +201,7 @@ public:
   {
     std::unique_ptr<cuda_blackboard::CudaPointCloud2> filtered_cloud;
     std::unique_ptr<cuda_blackboard::CudaPointCloud2> noise_cloud;
+    std::unique_ptr<cuda_blackboard::CudaPointCloud2> ground_cloud;
   };
 
   enum class PolarDataType : uint8_t { PreComputed, DeriveFromCartesian };
@@ -265,6 +320,7 @@ private:
   CubExecutor cub_executor_;
 
   std::optional<ReturnTypeCandidates> primary_return_type_dev_;
+  std::vector<int> primary_return_types_host_;
 };
 }  // namespace autoware::cuda_pointcloud_preprocessor
 

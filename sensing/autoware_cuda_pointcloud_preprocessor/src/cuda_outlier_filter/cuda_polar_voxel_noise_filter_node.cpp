@@ -55,6 +55,74 @@ CudaPolarVoxelNoiseFilterNode::CudaPolarVoxelNoiseFilterNode(
     filter_params_.secondary_noise_threshold = declare_parameter<int>("secondary_noise_threshold");
     filter_params_.intensity_threshold = declare_parameter<uint8_t>("intensity_threshold");
     filter_params_.publish_noise_cloud = declare_parameter<bool>("publish_noise_cloud");
+    filter_params_.publish_ground_cloud = declare_parameter<bool>("publish_ground_cloud", true);
+
+    // CPU-parity mode (near/far zones + metrics)
+    filter_params_.use_near_far_zones = declare_parameter<bool>("use_near_far_zones", false);
+    filter_params_.near_radius_min = declare_parameter<double>("near_radius_min", 0.0);
+    filter_params_.near_radius_max = declare_parameter<double>("near_radi_max", 20.0);
+    filter_params_.near_z_min = declare_parameter<double>("near_z_min", -10.0);
+    filter_params_.near_z_max = declare_parameter<double>("near_z_max", 10.0);
+    filter_params_.near_radius_step = declare_parameter<double>("near_radius_step", 0.6);
+    filter_params_.near_azimuth_step = declare_parameter<double>("near_azimuth_step", 0.1);
+    filter_params_.near_z_step = declare_parameter<double>("near_z_step", 0.6);
+    filter_params_.near_intensity_threshold = declare_parameter<double>("near_intensity_threshold", 0.5);
+
+    filter_params_.far_radius_min = declare_parameter<double>("far_radius_min", 20.0);
+    filter_params_.far_radius_max = declare_parameter<double>("far_radius_max", 60.0);
+    filter_params_.far_z_min = declare_parameter<double>("far_z_min", -10.0);
+    filter_params_.far_z_max = declare_parameter<double>("far_z_max", 10.0);
+    filter_params_.far_radius_step = declare_parameter<double>("far_radius_step", 0.6);
+    filter_params_.far_azimuth_step = declare_parameter<double>("far_azimuth_step", 0.1);
+    filter_params_.far_z_step = declare_parameter<double>("far_z_step", 0.6);
+    filter_params_.far_intensity_threshold = declare_parameter<double>("far_intensity_threshold", 0.5);
+
+    filter_params_.voxel_noise_low_count_threshold =
+      static_cast<int>(declare_parameter<int64_t>("voxel_noise_low_count_threshold", 5));
+    filter_params_.voxel_noise_intensity_avg_threshold =
+      declare_parameter<double>("voxel_noise_intensity_avg_threshold", 0.01);
+    filter_params_.voxel_noise_ret_secondary_threshold =
+      static_cast<int>(declare_parameter<int64_t>("voxel_noise_ret_secondary_threshold", 5));
+
+    filter_params_.near_voxel_noise_count_min =
+      static_cast<int>(declare_parameter<int64_t>("near_voxel_noise_count_min", 5));
+    filter_params_.near_voxel_noise_count_max =
+      static_cast<int>(declare_parameter<int64_t>("near_voxel_noise_count_max", 20));
+    filter_params_.near_voxel_noise_int_avg_max =
+      declare_parameter<double>("near_voxel_noise_int_avg_max", 0.01);
+    filter_params_.near_voxel_noise_ent_min =
+      declare_parameter<double>("near_voxel_noise_ent_min", 0.1);
+    filter_params_.near_voxel_noise_anis_max =
+      declare_parameter<double>("near_voxel_noise_anis_max", 0.995);
+
+    filter_params_.far_voxel_noise_count_min =
+      static_cast<int>(declare_parameter<int64_t>("far_voxel_noise_count_min", 7));
+    filter_params_.far_voxel_noise_count_max =
+      static_cast<int>(declare_parameter<int64_t>("far_voxel_noise_count_max", 25));
+    filter_params_.far_voxel_noise_int_avg_max =
+      declare_parameter<double>("far_voxel_noise_int_avg_max", 0.01);
+    filter_params_.far_voxel_noise_ent_min =
+      declare_parameter<double>("far_voxel_noise_ent_min", 0.1);
+    filter_params_.far_voxel_noise_anis_max =
+      declare_parameter<double>("far_voxel_noise_anis_max", 0.995);
+
+    filter_params_.run_ground_refinement = declare_parameter<bool>("run_ground_refinement", true);
+    filter_params_.run_second_refinement = declare_parameter<bool>("run_second_refinement", true);
+    filter_params_.ground_refinement_distance_threshold =
+      declare_parameter<double>("ground_refinement_distance_threshold", 0.2);
+    filter_params_.ground_refinement_voxel_size =
+      declare_parameter<double>("ground_refinement_voxel_size", 0.3);
+    filter_params_.ground_refinement_claim_ratio =
+      declare_parameter<double>("ground_refinement_claim_ratio", 0.1);
+    filter_params_.second_refinement_radius =
+      static_cast<int>(declare_parameter<int64_t>("second_refinement_radius", 1));
+    auto secondary_return_types_param = declare_parameter<std::vector<int64_t>>(
+      "secondary_return_types", std::vector<int64_t>{3, 4, 5, 7, 9});
+    filter_params_.secondary_return_types.clear();
+    filter_params_.secondary_return_types.reserve(secondary_return_types_param.size());
+    for (const auto & val : secondary_return_types_param) {
+      filter_params_.secondary_return_types.push_back(static_cast<int>(val));
+    }
 
     // rclcpp always returns integer array as std::vector<int64_t>
     auto primary_return_types_param =
@@ -88,6 +156,15 @@ CudaPolarVoxelNoiseFilterNode::CudaPolarVoxelNoiseFilterNode(
     RCLCPP_INFO(get_logger(), "Noise cloud publishing enabled");
   } else {
     RCLCPP_INFO(get_logger(), "Noise cloud publishing disabled for performance optimization");
+  }
+
+  if (filter_params_.publish_ground_cloud) {
+    ground_cloud_pub_ =
+      std::make_unique<cuda_blackboard::CudaBlackboardPublisher<cuda_blackboard::CudaPointCloud2>>(
+        *this, "~/debug/pointcloud_ground");
+    RCLCPP_INFO(get_logger(), "Ground cloud publishing enabled");
+  } else {
+    RCLCPP_INFO(get_logger(), "Ground cloud publishing disabled");
   }
 
   using std::placeholders::_1;
@@ -141,6 +218,7 @@ void CudaPolarVoxelNoiseFilterNode::pointcloud_callback(
 
   filtered_cloud = std::move(filter_return.filtered_cloud);
   noise_cloud = std::move(filter_return.noise_cloud);
+  auto ground_cloud = std::move(filter_return.ground_cloud);
 
   if (!filtered_cloud) {
     // filtered_cloud contains nullptr
@@ -151,6 +229,9 @@ void CudaPolarVoxelNoiseFilterNode::pointcloud_callback(
   filtered_cloud_pub_->publish(std::move(filtered_cloud));
   if (filter_params_.publish_noise_cloud && noise_cloud_pub_) {
     noise_cloud_pub_->publish(std::move(noise_cloud));
+  }
+  if (filter_params_.publish_ground_cloud && ground_cloud_pub_) {
+    ground_cloud_pub_->publish(std::move(ground_cloud));
   }
 }
 
@@ -298,9 +379,128 @@ rcl_interfaces::msg::SetParametersResult CudaPolarVoxelNoiseFilterNode::param_ca
         for (auto v : arr) primary_return_types_.push_back(static_cast<int>(v));
         cuda_polar_voxel_noise_filter_->set_primary_return_types(primary_return_types_);
       }}},
+    {"secondary_return_types",
+     {validate_primary_return_types,
+      [this](const rclcpp::Parameter & p) {
+        const auto & arr = p.as_integer_array();
+        filter_params_.secondary_return_types.clear();
+        filter_params_.secondary_return_types.reserve(arr.size());
+        for (auto v : arr) filter_params_.secondary_return_types.push_back(static_cast<int>(v));
+      }}},
     {"publish_noise_cloud",
      {nullptr,
-      [this](const rclcpp::Parameter & p) { filter_params_.publish_noise_cloud = p.as_bool(); }}}};
+      [this](const rclcpp::Parameter & p) { filter_params_.publish_noise_cloud = p.as_bool(); }}},
+    {"publish_ground_cloud",
+     {nullptr,
+      [this](const rclcpp::Parameter & p) { filter_params_.publish_ground_cloud = p.as_bool(); }}},
+    {"use_near_far_zones", {nullptr, [this](const rclcpp::Parameter & p) {
+                               filter_params_.use_near_far_zones = p.as_bool();
+                             }}},
+    {"near_radius_min", {nullptr, [this](const rclcpp::Parameter & p) {
+                           filter_params_.near_radius_min = p.as_double();
+                         }}},
+    {"near_radi_max", {nullptr, [this](const rclcpp::Parameter & p) {
+                         filter_params_.near_radius_max = p.as_double();
+                       }}},
+    {"near_z_min", {nullptr, [this](const rclcpp::Parameter & p) {
+                      filter_params_.near_z_min = p.as_double();
+                    }}},
+    {"near_z_max", {nullptr, [this](const rclcpp::Parameter & p) {
+                      filter_params_.near_z_max = p.as_double();
+                    }}},
+    {"near_radius_step", {nullptr, [this](const rclcpp::Parameter & p) {
+                            filter_params_.near_radius_step = p.as_double();
+                          }}},
+    {"near_azimuth_step", {nullptr, [this](const rclcpp::Parameter & p) {
+                             filter_params_.near_azimuth_step = p.as_double();
+                           }}},
+    {"near_z_step", {nullptr, [this](const rclcpp::Parameter & p) {
+                       filter_params_.near_z_step = p.as_double();
+                     }}},
+    {"near_intensity_threshold", {nullptr, [this](const rclcpp::Parameter & p) {
+                                    filter_params_.near_intensity_threshold = p.as_double();
+                                  }}},
+    {"far_radius_min", {nullptr, [this](const rclcpp::Parameter & p) {
+                          filter_params_.far_radius_min = p.as_double();
+                        }}},
+    {"far_radius_max", {nullptr, [this](const rclcpp::Parameter & p) {
+                          filter_params_.far_radius_max = p.as_double();
+                        }}},
+    {"far_z_min", {nullptr, [this](const rclcpp::Parameter & p) {
+                     filter_params_.far_z_min = p.as_double();
+                   }}},
+    {"far_z_max", {nullptr, [this](const rclcpp::Parameter & p) {
+                     filter_params_.far_z_max = p.as_double();
+                   }}},
+    {"far_radius_step", {nullptr, [this](const rclcpp::Parameter & p) {
+                           filter_params_.far_radius_step = p.as_double();
+                         }}},
+    {"far_azimuth_step", {nullptr, [this](const rclcpp::Parameter & p) {
+                            filter_params_.far_azimuth_step = p.as_double();
+                          }}},
+    {"far_z_step", {nullptr, [this](const rclcpp::Parameter & p) {
+                      filter_params_.far_z_step = p.as_double();
+                    }}},
+    {"far_intensity_threshold", {nullptr, [this](const rclcpp::Parameter & p) {
+                                   filter_params_.far_intensity_threshold = p.as_double();
+                                 }}},
+    {"voxel_noise_low_count_threshold", {validate_non_negative_int, [this](const rclcpp::Parameter & p) {
+                                          filter_params_.voxel_noise_low_count_threshold = p.as_int();
+                                        }}},
+    {"voxel_noise_intensity_avg_threshold", {validate_non_negative_double, [this](const rclcpp::Parameter & p) {
+                                              filter_params_.voxel_noise_intensity_avg_threshold = p.as_double();
+                                            }}},
+    {"voxel_noise_ret_secondary_threshold", {validate_non_negative_int, [this](const rclcpp::Parameter & p) {
+                                              filter_params_.voxel_noise_ret_secondary_threshold = p.as_int();
+                                            }}},
+    {"near_voxel_noise_count_min", {validate_non_negative_int, [this](const rclcpp::Parameter & p) {
+                                     filter_params_.near_voxel_noise_count_min = p.as_int();
+                                   }}},
+    {"near_voxel_noise_count_max", {validate_non_negative_int, [this](const rclcpp::Parameter & p) {
+                                     filter_params_.near_voxel_noise_count_max = p.as_int();
+                                   }}},
+    {"near_voxel_noise_int_avg_max", {validate_non_negative_double, [this](const rclcpp::Parameter & p) {
+                                       filter_params_.near_voxel_noise_int_avg_max = p.as_double();
+                                     }}},
+    {"near_voxel_noise_ent_min", {validate_non_negative_double, [this](const rclcpp::Parameter & p) {
+                                   filter_params_.near_voxel_noise_ent_min = p.as_double();
+                                 }}},
+    {"near_voxel_noise_anis_max", {validate_normalized, [this](const rclcpp::Parameter & p) {
+                                     filter_params_.near_voxel_noise_anis_max = p.as_double();
+                                   }}},
+    {"far_voxel_noise_count_min", {validate_non_negative_int, [this](const rclcpp::Parameter & p) {
+                                    filter_params_.far_voxel_noise_count_min = p.as_int();
+                                  }}},
+    {"far_voxel_noise_count_max", {validate_non_negative_int, [this](const rclcpp::Parameter & p) {
+                                    filter_params_.far_voxel_noise_count_max = p.as_int();
+                                  }}},
+    {"far_voxel_noise_int_avg_max", {validate_non_negative_double, [this](const rclcpp::Parameter & p) {
+                                      filter_params_.far_voxel_noise_int_avg_max = p.as_double();
+                                    }}},
+    {"far_voxel_noise_ent_min", {validate_non_negative_double, [this](const rclcpp::Parameter & p) {
+                                  filter_params_.far_voxel_noise_ent_min = p.as_double();
+                                }}},
+    {"far_voxel_noise_anis_max", {validate_normalized, [this](const rclcpp::Parameter & p) {
+                                    filter_params_.far_voxel_noise_anis_max = p.as_double();
+                                  }}},
+    {"run_ground_refinement", {nullptr, [this](const rclcpp::Parameter & p) {
+                                filter_params_.run_ground_refinement = p.as_bool();
+                              }}},
+    {"run_second_refinement", {nullptr, [this](const rclcpp::Parameter & p) {
+                                filter_params_.run_second_refinement = p.as_bool();
+                              }}},
+    {"ground_refinement_distance_threshold", {validate_non_negative_double, [this](const rclcpp::Parameter & p) {
+                                               filter_params_.ground_refinement_distance_threshold = p.as_double();
+                                             }}},
+    {"ground_refinement_voxel_size", {validate_positive_double, [this](const rclcpp::Parameter & p) {
+                                       filter_params_.ground_refinement_voxel_size = p.as_double();
+                                     }}},
+    {"ground_refinement_claim_ratio", {validate_normalized, [this](const rclcpp::Parameter & p) {
+                                        filter_params_.ground_refinement_claim_ratio = p.as_double();
+                                      }}},
+    {"second_refinement_radius", {validate_non_negative_int, [this](const rclcpp::Parameter & p) {
+                                   filter_params_.second_refinement_radius = p.as_int();
+                                 }}}};
 
   for (const auto & param : params) {
     auto it = param_ops.find(param.get_name());
@@ -331,17 +531,17 @@ void CudaPolarVoxelNoiseFilterNode::validate_filter_inputs(
 void CudaPolarVoxelNoiseFilterNode::validate_return_type_field(
   const cuda_blackboard::CudaPointCloud2::ConstSharedPtr & input_cloud)
 {
-  if (!filter_params_.use_return_type_classification) {
+  if (!filter_params_.use_return_type_classification && !filter_params_.use_near_far_zones) {
     return;
   }
 
   if (!has_field(input_cloud, "return_type")) {
     RCLCPP_ERROR(
       get_logger(),
-      "Advanced mode (use_return_type_classification=true) requires 'return_type' field. "
-      "Set use_return_type_classification=false for simple mode or ensure input has return_type "
-      "field.");
-    throw std::invalid_argument("Advanced mode requires return_type field");
+      "This filter mode requires a 'return_type' field. "
+      "Set use_return_type_classification=false and use_near_far_zones=false for simple mode or "
+      "ensure input has return_type field.");
+    throw std::invalid_argument("Configured mode requires return_type field");
   }
 }
 

@@ -23,14 +23,26 @@
 #include <cuda_blackboard/cuda_pointcloud2.hpp>
 #include <rclcpp/exceptions/exceptions.hpp>
 
+#include <Eigen/Dense>
+#include <Eigen/Eigenvalues>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <locale>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
+#include <unordered_map>
+#include <vector>
 
 namespace autoware::cuda_pointcloud_preprocessor
 {
@@ -88,6 +100,30 @@ struct NulloptToLowest
     return opt.has_value() ? opt.value() : ::cuda::std::numeric_limits<DataType>::lowest();
   }
 };
+
+__device__ __forceinline__ float atomicMinFloat(float * addr, float value)
+{
+  int * addr_as_i = reinterpret_cast<int *>(addr);
+  int old = *addr_as_i, assumed;
+  while (value < __int_as_float(old)) {
+    assumed = old;
+    old = atomicCAS(addr_as_i, assumed, __float_as_int(value));
+    if (assumed == old) break;
+  }
+  return __int_as_float(old);
+}
+
+__device__ __forceinline__ float atomicMaxFloat(float * addr, float value)
+{
+  int * addr_as_i = reinterpret_cast<int *>(addr);
+  int old = *addr_as_i, assumed;
+  while (value > __int_as_float(old)) {
+    assumed = old;
+    old = atomicCAS(addr_as_i, assumed, __float_as_int(value));
+    if (assumed == old) break;
+  }
+  return __int_as_float(old);
+}
 
 /** \brief factory utility function to allocate unique_ptr and FieldDataComposer with allocated
  * pointer
@@ -348,13 +384,21 @@ template <typename TReturnType, typename TIntensity>
 __global__ void classify_point_and_sum_stats_kernel(
   const uint8_t * __restrict__ data, const size_t num_points, const int num_voxels,
   const size_t step, const size_t return_type_offset, const size_t intensity_offset,
+  const size_t x_offset, const size_t y_offset, const size_t z_offset,
   const ReturnTypeCandidates primary_return_type,
+  const uint8_t point_intensity_threshold,
   const ::cuda::std::optional<int> * __restrict__ point_indices,
   const int * __restrict__ voxel_indices,
   size_t * __restrict__ total_counts,
   float * __restrict__ intensity_sums,
   size_t * __restrict__ secondary_counts,
-  bool * __restrict__ is_primary_flags)
+  bool * __restrict__ is_primary_flags,
+  // geometry accumulators (included points only)
+  float * __restrict__ sum_x, float * __restrict__ sum_y, float * __restrict__ sum_z,
+  float * __restrict__ sum_xx, float * __restrict__ sum_xy, float * __restrict__ sum_xz,
+  float * __restrict__ sum_yy, float * __restrict__ sum_yz, float * __restrict__ sum_zz,
+  float * __restrict__ min_x, float * __restrict__ min_y, float * __restrict__ min_z,
+  float * __restrict__ max_x, float * __restrict__ max_y, float * __restrict__ max_z)
 {
   auto array_index = blockIdx.x * blockDim.x + threadIdx.x;
   if (array_index >= num_points) return;
@@ -369,6 +413,9 @@ __global__ void classify_point_and_sum_stats_kernel(
   // Get raw data
   auto return_type = get_element_value<TReturnType>(data, pt_idx, step, return_type_offset);
   auto intensity = get_element_value<TIntensity>(data, pt_idx, step, intensity_offset);
+  auto x = get_element_value<float>(data, pt_idx, step, x_offset);
+  auto y = get_element_value<float>(data, pt_idx, step, y_offset);
+  auto z = get_element_value<float>(data, pt_idx, step, z_offset);
 
   // Determine if primary
   bool is_primary = false;
@@ -381,13 +428,316 @@ __global__ void classify_point_and_sum_stats_kernel(
   
   is_primary_flags[pt_idx] = is_primary;
 
+  // Always include points in voxel stats (prevents all-empty output depending on intensity config).
+  // Intensity gating is applied only to how we count "secondary" returns.
+  const int intensity_threshold_for_voxel = 40;
+  const bool meets_int =
+    meets_intensity_threshold(static_cast<uint8_t>(intensity), intensity_threshold_for_voxel);
+
   // Atomic updates for voxel stats
   atomic_add_size_t(&(total_counts[vox_idx]), 1);
   atomicAdd(&(intensity_sums[vox_idx]), static_cast<float>(intensity));
-  
-  if (!is_primary) {
+  atomicAdd(&(sum_x[vox_idx]), x);
+  atomicAdd(&(sum_y[vox_idx]), y);
+  atomicAdd(&(sum_z[vox_idx]), z);
+  atomicAdd(&(sum_xx[vox_idx]), x * x);
+  atomicAdd(&(sum_xy[vox_idx]), x * y);
+  atomicAdd(&(sum_xz[vox_idx]), x * z);
+  atomicAdd(&(sum_yy[vox_idx]), y * y);
+  atomicAdd(&(sum_yz[vox_idx]), y * z);
+  atomicAdd(&(sum_zz[vox_idx]), z * z);
+  atomicMinFloat(&(min_x[vox_idx]), x);
+  atomicMinFloat(&(min_y[vox_idx]), y);
+  atomicMinFloat(&(min_z[vox_idx]), z);
+  atomicMaxFloat(&(max_x[vox_idx]), x);
+  atomicMaxFloat(&(max_y[vox_idx]), y);
+  atomicMaxFloat(&(max_z[vox_idx]), z);
+
+  if (!is_primary && meets_int) {
     atomic_add_size_t(&(secondary_counts[vox_idx]), 1);
   }
+}
+
+enum class VoxelCategory : uint8_t
+{
+  kLowCountLowIntensity = 0,
+  kLowCountOnly,
+  kGround,
+  kMisclassifiedNoise,
+  kNoise,
+  kSignal,
+  kPossibleNoise
+};
+
+struct Zone
+{
+  std::string name;
+  double r_min;
+  double r_max;
+  double z_min;
+  double z_max;
+  double r_step;
+  double az_step;
+  double z_step;
+  double intensity_threshold;
+};
+
+struct ZonePoint
+{
+  float x;
+  float y;
+  float z;
+  float intensity;
+  int return_type;
+};
+
+struct VoxelMetrics
+{
+  int count{0};
+  float int_avg{0.0f};
+  int ret_weak{0};
+  int ret_strong{0};
+  float ret_ratio{0.0f};
+  float min_x{0.0f};
+  float min_y{0.0f};
+  float min_z{0.0f};
+  float max_x{0.0f};
+  float max_y{0.0f};
+  float max_z{0.0f};
+  float x_spread{0.0f};
+  float y_spread{0.0f};
+  float z_spread{0.0f};
+  float std_x{0.0f};
+  float std_y{0.0f};
+  float std_z{0.0f};
+  float l1{0.0f};
+  float l2{0.0f};
+  float l3{0.0f};
+  float lin{0.0f};
+  float plan{0.0f};
+  float anis{0.0f};
+  float curv{0.0f};
+  float sum_e{0.0f};
+  float ent{0.0f};
+};
+
+struct ZoneVoxelCoord
+{
+  int r_idx;
+  int az_idx;
+  int z_idx;
+
+  bool operator==(const ZoneVoxelCoord & other) const
+  {
+    return r_idx == other.r_idx && az_idx == other.az_idx && z_idx == other.z_idx;
+  }
+};
+
+struct ZoneVoxelCoordHash
+{
+  size_t operator()(const ZoneVoxelCoord & coord) const
+  {
+    size_t h1 = std::hash<int>{}(coord.r_idx);
+    size_t h2 = std::hash<int>{}(coord.az_idx);
+    size_t h3 = std::hash<int>{}(coord.z_idx);
+    return h1 ^ (h2 << 1U) ^ (h3 << 2U);
+  }
+};
+
+struct ZoneVoxelRecord
+{
+  std::string zone_name;
+  ZoneVoxelCoord coord{};
+  std::vector<size_t> point_indices;
+  VoxelCategory category{VoxelCategory::kPossibleNoise};
+  bool is_noise{false};
+  bool has_metrics{false};
+  VoxelMetrics metrics{};
+};
+
+__host__ __device__ __forceinline__ bool is_noise_category(const VoxelCategory c)
+{
+  return c == VoxelCategory::kNoise || c == VoxelCategory::kLowCountLowIntensity;
+}
+
+__device__ __forceinline__ void eigenvalues_sym3x3(
+  float a00, float a01, float a02, float a11, float a12, float a22, float & l1, float & l2,
+  float & l3)
+{
+  // Analytic eigenvalues for symmetric 3x3 (Numerical Recipes / Wikipedia).
+  const float p1 = a01 * a01 + a02 * a02 + a12 * a12;
+  if (p1 == 0.0f) {
+    // diagonal
+    float e0 = a00, e1 = a11, e2 = a22;
+    // sort descending
+    if (e0 < e1) { float t = e0; e0 = e1; e1 = t; }
+    if (e1 < e2) { float t = e1; e1 = e2; e2 = t; }
+    if (e0 < e1) { float t = e0; e0 = e1; e1 = t; }
+    l1 = e0; l2 = e1; l3 = e2;
+    return;
+  }
+
+  const float q = (a00 + a11 + a22) / 3.0f;
+  const float b00 = a00 - q;
+  const float b11 = a11 - q;
+  const float b22 = a22 - q;
+  const float p2 = b00 * b00 + b11 * b11 + b22 * b22 + 2.0f * p1;
+  const float p = sqrtf(p2 / 6.0f);
+  // C = (1/p) * (A - qI)
+  const float c00 = b00 / p;
+  const float c01 = a01 / p;
+  const float c02 = a02 / p;
+  const float c11 = b11 / p;
+  const float c12 = a12 / p;
+  const float c22 = b22 / p;
+  const float detC =
+    c00 * (c11 * c22 - c12 * c12) - c01 * (c01 * c22 - c12 * c02) +
+    c02 * (c01 * c12 - c11 * c02);
+  float r = detC / 2.0f;
+  r = fminf(fmaxf(r, -1.0f), 1.0f);
+  const float phi = acosf(r) / 3.0f;
+  const float two_pi_over_3 = 2.09439510239319549f;
+  l1 = q + 2.0f * p * cosf(phi);
+  l3 = q + 2.0f * p * cosf(phi + two_pi_over_3);
+  l2 = 3.0f * q - l1 - l3;
+  // sort descending
+  if (l1 < l2) { float t = l1; l1 = l2; l2 = t; }
+  if (l2 < l3) { float t = l2; l2 = l3; l3 = t; }
+  if (l1 < l2) { float t = l1; l1 = l2; l2 = t; }
+}
+
+__global__ void compute_voxel_category_kernel(
+  const size_t * __restrict__ total_counts,
+  const float * __restrict__ intensity_sums,
+  const size_t * __restrict__ secondary_counts,
+  const float * __restrict__ sum_x, const float * __restrict__ sum_y, const float * __restrict__ sum_z,
+  const float * __restrict__ sum_xx, const float * __restrict__ sum_xy, const float * __restrict__ sum_xz,
+  const float * __restrict__ sum_yy, const float * __restrict__ sum_yz, const float * __restrict__ sum_zz,
+  const float * __restrict__ min_x, const float * __restrict__ min_y, const float * __restrict__ min_z,
+  const float * __restrict__ max_x, const float * __restrict__ max_y, const float * __restrict__ max_z,
+  const size_t num_voxels,
+  const int low_count_threshold,
+  const float low_int_avg_threshold,
+  const int secondary_ret_threshold,
+  uint8_t * __restrict__ out_category,
+  bool * __restrict__ out_voxel_valid,
+  bool * __restrict__ out_voxel_ground)
+{
+  const auto vox_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (vox_idx >= num_voxels) return;
+
+  const size_t count = total_counts[vox_idx];
+  if (count == 0) {
+    out_category[vox_idx] = static_cast<uint8_t>(VoxelCategory::kPossibleNoise);
+    out_voxel_valid[vox_idx] = false;
+    out_voxel_ground[vox_idx] = false;
+    return;
+  }
+  const float int_avg = intensity_sums[vox_idx] / static_cast<float>(count);
+  const int ret_weak = static_cast<int>(secondary_counts[vox_idx]);
+
+  // Early categories (CPU parity-ish)
+  if (static_cast<int>(count) < low_count_threshold && int_avg < low_int_avg_threshold) {
+    out_category[vox_idx] = static_cast<uint8_t>(VoxelCategory::kLowCountLowIntensity);
+    out_voxel_valid[vox_idx] = false;
+    out_voxel_ground[vox_idx] = false;
+    return;
+  }
+  if (static_cast<int>(count) < low_count_threshold) {
+    out_category[vox_idx] = static_cast<uint8_t>(VoxelCategory::kLowCountOnly);
+    out_voxel_valid[vox_idx] = true;
+    out_voxel_ground[vox_idx] = false;
+    return;
+  }
+  if (ret_weak > secondary_ret_threshold && int_avg < low_int_avg_threshold) {
+    out_category[vox_idx] = static_cast<uint8_t>(VoxelCategory::kLowCountLowIntensity);
+    out_voxel_valid[vox_idx] = false;
+    out_voxel_ground[vox_idx] = false;
+    return;
+  }
+
+  // Compute covariance from sums (unbiased approx not needed; CPU uses (n-1) but ratios ok)
+  const float inv_n = 1.0f / static_cast<float>(count);
+  const float mx = sum_x[vox_idx] * inv_n;
+  const float my = sum_y[vox_idx] * inv_n;
+  const float mz = sum_z[vox_idx] * inv_n;
+
+  const float c00 = fmaxf(0.0f, sum_xx[vox_idx] * inv_n - mx * mx);
+  const float c01 = sum_xy[vox_idx] * inv_n - mx * my;
+  const float c02 = sum_xz[vox_idx] * inv_n - mx * mz;
+  const float c11 = fmaxf(0.0f, sum_yy[vox_idx] * inv_n - my * my);
+  const float c12 = sum_yz[vox_idx] * inv_n - my * mz;
+  const float c22 = fmaxf(0.0f, sum_zz[vox_idx] * inv_n - mz * mz);
+
+  float L1, L2, L3;
+  eigenvalues_sym3x3(c00, c01, c02, c11, c12, c22, L1, L2, L3);
+  L1 = fmaxf(L1, 1e-9f);
+  L2 = fmaxf(L2, 1e-9f);
+  L3 = fmaxf(L3, 1e-9f);
+  const float sum_ev = L1 + L2 + L3;
+  const float l1 = L1 / sum_ev;
+  const float l2 = L2 / sum_ev;
+  const float l3 = L3 / sum_ev;
+  const float lin = (L1 - L2) / L1;
+  const float plan = (L2 - L3) / L1;
+  const float anis = (L1 - L3) / L1;
+
+  float ent = 0.0f;
+  if (l1 > 0.0f) ent -= l1 * logf(l1);
+  if (l2 > 0.0f) ent -= l2 * logf(l2);
+  if (l3 > 0.0f) ent -= l3 * logf(l3);
+  ent /= 1.0986122886681098f;  // log(3)
+
+  const float x_spread = max_x[vox_idx] - min_x[vox_idx];
+  const float y_spread = max_y[vox_idx] - min_y[vox_idx];
+  const float z_spread = max_z[vox_idx] - min_z[vox_idx];
+
+  // Category rules (from CPU; no zone split here)
+  const bool condition_ground =
+    (static_cast<int>(count) > 10 && int_avg < 5.0f && anis > 0.997f) ||
+    (static_cast<int>(count) > 10 && lin > 0.9f && plan < 0.1f && anis > 0.997f);
+  if (condition_ground) {
+    out_category[vox_idx] = static_cast<uint8_t>(VoxelCategory::kGround);
+    out_voxel_valid[vox_idx] = true;
+    out_voxel_ground[vox_idx] = true;
+    return;
+  }
+
+  const bool condition_misclassified_noise =
+    ((static_cast<int>(count) < 50 && int_avg < 0.01f && ent > 0.5f && (x_spread < 0.1f || y_spread < 0.1f)) ||
+     (static_cast<int>(count) < 10 && anis > 0.99f));
+  if (condition_misclassified_noise) {
+    out_category[vox_idx] = static_cast<uint8_t>(VoxelCategory::kMisclassifiedNoise);
+    out_voxel_valid[vox_idx] = true;
+    out_voxel_ground[vox_idx] = false;
+    return;
+  }
+
+  if (static_cast<int>(count) > 5 && int_avg > 1.0f) {
+    out_category[vox_idx] = static_cast<uint8_t>(VoxelCategory::kSignal);
+    out_voxel_valid[vox_idx] = true;
+    out_voxel_ground[vox_idx] = false;
+    return;
+  }
+
+  out_category[vox_idx] = static_cast<uint8_t>(VoxelCategory::kPossibleNoise);
+  out_voxel_valid[vox_idx] = true;
+  out_voxel_ground[vox_idx] = false;
+}
+
+__global__ void init_minmax_kernel(
+  float * __restrict__ min_x, float * __restrict__ min_y, float * __restrict__ min_z,
+  float * __restrict__ max_x, float * __restrict__ max_y, float * __restrict__ max_z,
+  const size_t num_voxels)
+{
+  const auto vox_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (vox_idx >= num_voxels) return;
+  min_x[vox_idx] = ::cuda::std::numeric_limits<float>::max();
+  min_y[vox_idx] = ::cuda::std::numeric_limits<float>::max();
+  min_z[vox_idx] = ::cuda::std::numeric_limits<float>::max();
+  max_x[vox_idx] = ::cuda::std::numeric_limits<float>::lowest();
+  max_y[vox_idx] = ::cuda::std::numeric_limits<float>::lowest();
+  max_z[vox_idx] = ::cuda::std::numeric_limits<float>::lowest();
 }
 
 // __global__ void evaluate_voxel_validity_kernel(
@@ -636,6 +986,334 @@ size_t get_offset(const T & fields, const std::string & field_name)
   }
   return fields[index].offset;
 }
+
+template <typename T>
+T get_host_element_value(
+  const std::vector<uint8_t> & data, const size_t index, const size_t step, const size_t offset)
+{
+  T value{};
+  std::memcpy(&value, data.data() + index * step + offset, sizeof(T));
+  return value;
+}
+
+inline bool contains_return_type(const std::vector<int> & return_types, const int return_type)
+{
+  return std::find(return_types.begin(), return_types.end(), return_type) != return_types.end();
+}
+
+inline int count_secondary_returns(
+  const std::vector<int> & secondary_return_types, const int return_type)
+{
+  return contains_return_type(secondary_return_types, return_type) ? 1 : 0;
+}
+
+inline int count_primary_returns(
+  const std::vector<int> & primary_return_types, const int return_type)
+{
+  return contains_return_type(primary_return_types, return_type) ? 1 : 0;
+}
+
+inline VoxelCategory find_voxel_category(
+  const int count, const float int_avg, const VoxelMetrics * metrics, const std::string & zone_name,
+  const CudaPolarVoxelNoiseFilterParameters &)
+{
+  if (metrics == nullptr) {
+    if (zone_name == "Near") {
+      if (count < 5 && int_avg < 0.01f) return VoxelCategory::kLowCountLowIntensity;
+      if (count < 5) return VoxelCategory::kLowCountOnly;
+      return VoxelCategory::kSignal;
+    }
+    if (zone_name == "Far") {
+      if (count < 3 && int_avg < 0.01f) return VoxelCategory::kLowCountLowIntensity;
+      if (count < 3) return VoxelCategory::kLowCountOnly;
+      return VoxelCategory::kSignal;
+    }
+    return VoxelCategory::kPossibleNoise;
+  }
+
+  const auto & m = *metrics;
+  if (zone_name == "Near") {
+    const bool condition_ground =
+      ((count > 10 && m.int_avg < 5.0f && m.anis > 0.997f) ||
+       (count > 10 && m.lin > 0.9f && m.plan < 0.1f && m.anis > 0.997f));
+    if (condition_ground) return VoxelCategory::kGround;
+
+    const bool condition_misclassified_noise =
+      ((m.count < 50 && m.int_avg < 0.01f && m.ent > 0.5f &&
+        (m.x_spread < 0.1f || m.y_spread < 0.1f)) ||
+       (count < 10 && m.anis > 0.99f));
+    if (condition_misclassified_noise) return VoxelCategory::kMisclassifiedNoise;
+
+    if (m.count > 5 && m.int_avg > 1.0f) return VoxelCategory::kSignal;
+    return VoxelCategory::kPossibleNoise;
+  }
+
+  if (zone_name == "Far") {
+    const bool condition_ground =
+      ((count > 10 && m.int_avg < 5.0f && m.anis > 0.997f) ||
+       (count > 10 && m.lin > 0.9f && m.plan < 0.1f && m.anis > 0.997f));
+    if (condition_ground) return VoxelCategory::kGround;
+
+    const bool condition_misclassified_noise =
+      (m.count > 30 && m.int_avg < 2.0f && m.anis < 0.995f && m.anis > 0.98f && m.ent > 0.5f &&
+       m.plan > 0.2f && m.lin < 0.5f);
+    if (condition_misclassified_noise) return VoxelCategory::kMisclassifiedNoise;
+
+    if (m.count > 3 && m.int_avg > 0.5f) return VoxelCategory::kSignal;
+    return VoxelCategory::kPossibleNoise;
+  }
+
+  return VoxelCategory::kPossibleNoise;
+}
+
+bool compute_metrics(
+  const std::vector<ZonePoint> & points, const std::vector<size_t> & indices,
+  const std::vector<int> & primary_return_types, const std::vector<int> & secondary_return_types,
+  VoxelMetrics & out)
+{
+  const size_t n = indices.size();
+  if (n < 3) return false;
+
+  out.count = static_cast<int>(n);
+  float sum_i = 0.0f;
+  int return_secondary = 0;
+  int return_primary = 0;
+  for (const size_t idx : indices) {
+    sum_i += points[idx].intensity;
+    return_secondary += count_secondary_returns(secondary_return_types, points[idx].return_type);
+    return_primary += count_primary_returns(primary_return_types, points[idx].return_type);
+  }
+  out.int_avg = sum_i / static_cast<float>(n);
+  out.ret_weak = return_secondary;
+  out.ret_strong = return_primary;
+  out.ret_ratio =
+    return_primary > 0 ? static_cast<float>(return_secondary) / static_cast<float>(return_primary)
+                       : 0.0f;
+
+  Eigen::MatrixXf mat(static_cast<Eigen::Index>(n), 3);
+  for (size_t i = 0; i < n; ++i) {
+    const auto & p = points[indices[i]];
+    mat(static_cast<Eigen::Index>(i), 0) = p.x;
+    mat(static_cast<Eigen::Index>(i), 1) = p.y;
+    mat(static_cast<Eigen::Index>(i), 2) = p.z;
+  }
+  const Eigen::Vector3f mean = mat.colwise().mean();
+  const Eigen::MatrixXf centered = mat.rowwise() - mean.transpose();
+  const Eigen::Matrix3f cov =
+    (centered.adjoint() * centered) / static_cast<float>(n - 1U);
+
+  out.min_x = std::numeric_limits<float>::max();
+  out.min_y = std::numeric_limits<float>::max();
+  out.min_z = std::numeric_limits<float>::max();
+  out.max_x = std::numeric_limits<float>::lowest();
+  out.max_y = std::numeric_limits<float>::lowest();
+  out.max_z = std::numeric_limits<float>::lowest();
+  for (const size_t idx : indices) {
+    const auto & p = points[idx];
+    out.min_x = std::min(out.min_x, p.x);
+    out.min_y = std::min(out.min_y, p.y);
+    out.min_z = std::min(out.min_z, p.z);
+    out.max_x = std::max(out.max_x, p.x);
+    out.max_y = std::max(out.max_y, p.y);
+    out.max_z = std::max(out.max_z, p.z);
+  }
+  out.x_spread = out.max_x - out.min_x;
+  out.y_spread = out.max_y - out.min_y;
+  out.z_spread = out.max_z - out.min_z;
+  out.std_x = std::sqrt(std::max(0.0f, cov(0, 0)));
+  out.std_y = std::sqrt(std::max(0.0f, cov(1, 1)));
+  out.std_z = std::sqrt(std::max(0.0f, cov(2, 2)));
+
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> eigensolver(cov);
+  const Eigen::Vector3f ev = eigensolver.eigenvalues();
+  const float L1 = std::max(ev(2), 1e-9f);
+  const float L2 = std::max(ev(1), 1e-9f);
+  const float L3 = std::max(ev(0), 1e-9f);
+  const float sum_ev = L1 + L2 + L3;
+  out.l1 = L1 / sum_ev;
+  out.l2 = L2 / sum_ev;
+  out.l3 = L3 / sum_ev;
+  out.lin = (L1 - L2) / L1;
+  out.plan = (L2 - L3) / L1;
+  out.anis = (L1 - L3) / L1;
+  out.curv = L3 / sum_ev;
+  out.sum_e = sum_ev;
+
+  out.ent = 0.0f;
+  if (out.l1 > 0.0f) out.ent -= out.l1 * std::log(out.l1);
+  if (out.l2 > 0.0f) out.ent -= out.l2 * std::log(out.l2);
+  if (out.l3 > 0.0f) out.ent -= out.l3 * std::log(out.l3);
+  out.ent /= 1.0986122886681098f;
+  return true;
+}
+
+std::vector<bool> apply_polynomial_refinement(
+  const std::vector<ZonePoint> & points, const std::vector<bool> & seed_ground_mask,
+  const float distance_threshold, const float voxel_size)
+{
+  std::vector<size_t> seed_indices;
+  seed_indices.reserve(points.size());
+  for (size_t i = 0; i < points.size(); ++i) {
+    if (i < seed_ground_mask.size() && seed_ground_mask[i]) {
+      seed_indices.push_back(i);
+    }
+  }
+  if (seed_indices.size() < 6) return seed_ground_mask;
+
+  using XYKey = std::pair<int, int>;
+  std::map<XYKey, size_t> unique_xy_to_seed;
+  for (const auto idx : seed_indices) {
+    const auto & p = points[idx];
+    const int x_idx = static_cast<int>(std::floor(p.x / voxel_size));
+    const int y_idx = static_cast<int>(std::floor(p.y / voxel_size));
+    const XYKey key{x_idx, y_idx};
+    if (!unique_xy_to_seed.count(key)) {
+      unique_xy_to_seed[key] = idx;
+    }
+  }
+
+  std::vector<size_t> sampled_indices;
+  sampled_indices.reserve(unique_xy_to_seed.size());
+  for (const auto & [xy_key, idx] : unique_xy_to_seed) {
+    (void)xy_key;
+    sampled_indices.push_back(idx);
+  }
+  if (sampled_indices.size() < 6) sampled_indices = seed_indices;
+  if (sampled_indices.size() < 6) return seed_ground_mask;
+
+  std::vector<float> sampled_z;
+  sampled_z.reserve(sampled_indices.size());
+  for (const auto idx : sampled_indices) sampled_z.push_back(points[idx].z);
+  std::sort(sampled_z.begin(), sampled_z.end());
+
+  const auto percentile_value = [&sampled_z](const double p) -> float {
+    if (sampled_z.empty()) return 0.0f;
+    const double pos = p * static_cast<double>(sampled_z.size() - 1U);
+    const size_t low = static_cast<size_t>(std::floor(pos));
+    const size_t high = static_cast<size_t>(std::ceil(pos));
+    if (low == high) return sampled_z[low];
+    const double t = pos - static_cast<double>(low);
+    return static_cast<float>((1.0 - t) * sampled_z[low] + t * sampled_z[high]);
+  };
+
+  const float q1 = percentile_value(0.25);
+  const float q3 = percentile_value(0.75);
+  const float iqr = q3 - q1;
+  const float lower_bound = q1 - 1.5f * iqr;
+  const float upper_bound = q3 + 1.5f * iqr;
+
+  std::vector<size_t> filtered_indices;
+  filtered_indices.reserve(sampled_indices.size());
+  for (const auto idx : sampled_indices) {
+    const float z = points[idx].z;
+    if (z >= lower_bound && z <= upper_bound) filtered_indices.push_back(idx);
+  }
+  if (filtered_indices.size() >= 6) sampled_indices.swap(filtered_indices);
+  if (sampled_indices.size() < 6) return seed_ground_mask;
+
+  Eigen::MatrixXf a(static_cast<Eigen::Index>(sampled_indices.size()), 6);
+  Eigen::VectorXf b(static_cast<Eigen::Index>(sampled_indices.size()));
+  for (size_t i = 0; i < sampled_indices.size(); ++i) {
+    const auto & p = points[sampled_indices[i]];
+    a(static_cast<Eigen::Index>(i), 0) = 1.0f;
+    a(static_cast<Eigen::Index>(i), 1) = p.x;
+    a(static_cast<Eigen::Index>(i), 2) = p.y;
+    a(static_cast<Eigen::Index>(i), 3) = p.x * p.x;
+    a(static_cast<Eigen::Index>(i), 4) = p.x * p.y;
+    a(static_cast<Eigen::Index>(i), 5) = p.y * p.y;
+    b(static_cast<Eigen::Index>(i)) = p.z;
+  }
+
+  const Eigen::VectorXf beta = a.colPivHouseholderQr().solve(b);
+  if (beta.size() != 6) return seed_ground_mask;
+
+  std::vector<bool> refined_ground_mask(points.size(), false);
+  for (size_t i = 0; i < points.size(); ++i) {
+    const auto & p = points[i];
+    const float z_pred =
+      beta(0) + beta(1) * p.x + beta(2) * p.y + beta(3) * p.x * p.x + beta(4) * p.x * p.y +
+      beta(5) * p.y * p.y;
+    refined_ground_mask[i] = std::abs(p.z - z_pred) < distance_threshold;
+  }
+  return refined_ground_mask;
+}
+
+void second_pass_refinement_after_ground(
+  std::vector<ZoneVoxelRecord> & voxel_records,
+  const std::unordered_map<ZoneVoxelCoord, size_t, ZoneVoxelCoordHash> & coord_to_record_idx,
+  std::vector<bool> & valid_mask, std::vector<bool> & ground_mask,
+  std::vector<bool> & possible_noise_mask, std::vector<bool> & low_count_mask,
+  std::vector<bool> & signal_mask, std::vector<bool> & misclassified_noise_mask, const int radius)
+{
+  const auto mark_as_noise = [&](ZoneVoxelRecord & rec) {
+    rec.category = VoxelCategory::kNoise;
+    rec.is_noise = true;
+    for (const size_t idx : rec.point_indices) {
+      valid_mask[idx] = false;
+      possible_noise_mask[idx] = false;
+      ground_mask[idx] = false;
+      low_count_mask[idx] = false;
+      misclassified_noise_mask[idx] = false;
+      signal_mask[idx] = false;
+    }
+  };
+
+  for (auto & rec : voxel_records) {
+    if (rec.category == VoxelCategory::kGround || rec.category == VoxelCategory::kSignal) continue;
+
+    int noise_votes = 0;
+    int total_neighbors = 0;
+    int low_count_neighbors = 0;
+    int signal_neighbors = 0;
+    for (int dr = -radius; dr <= radius; ++dr) {
+      for (int daz = -radius; daz <= radius; ++daz) {
+        for (int dz = -radius; dz <= radius; ++dz) {
+          if (dr == 0 && daz == 0 && dz == 0) continue;
+          const ZoneVoxelCoord neighbor_coord{
+            rec.coord.r_idx + dr, rec.coord.az_idx + daz, rec.coord.z_idx + dz};
+          const auto it = coord_to_record_idx.find(neighbor_coord);
+          if (it == coord_to_record_idx.end()) continue;
+          const auto & neighbor = voxel_records[it->second];
+          if (neighbor.category != VoxelCategory::kGround) total_neighbors++;
+          if (neighbor.category == VoxelCategory::kSignal) signal_neighbors++;
+          if (
+            neighbor.category == VoxelCategory::kLowCountLowIntensity ||
+            neighbor.category == VoxelCategory::kLowCountOnly) {
+            low_count_neighbors++;
+          }
+          if (neighbor.category == VoxelCategory::kNoise) noise_votes++;
+        }
+      }
+    }
+
+    if (total_neighbors < 2) {
+      mark_as_noise(rec);
+      continue;
+    }
+
+    if ((noise_votes + low_count_neighbors) > 0) {
+      const float noise_ratio = static_cast<float>(noise_votes + low_count_neighbors) /
+                                static_cast<float>(total_neighbors);
+      if (noise_ratio > 0.55f) {
+        mark_as_noise(rec);
+        continue;
+      }
+    }
+
+    if (signal_neighbors < 1 && low_count_neighbors > 2) mark_as_noise(rec);
+  }
+}
+
+std::vector<Zone> build_zones(const CudaPolarVoxelNoiseFilterParameters & params)
+{
+  return {
+    {"Near", params.near_radius_min, params.near_radius_max, params.near_z_min, params.near_z_max,
+     params.near_radius_step, params.near_azimuth_step, params.near_z_step,
+     params.near_intensity_threshold},
+    {"Far", params.far_radius_min, params.far_radius_max, params.far_z_min, params.far_z_max,
+     params.far_radius_step, params.far_azimuth_step, params.far_z_step,
+     params.far_intensity_threshold}};
+}
 }  // namespace
 
 CudaPolarVoxelNoiseFilter::CudaPolarVoxelNoiseFilter() : primary_return_type_dev_(std::nullopt)
@@ -654,8 +1332,16 @@ CudaPolarVoxelNoiseFilter::FilterReturn CudaPolarVoxelNoiseFilter::filter(
   const cuda_blackboard::CudaPointCloud2::ConstSharedPtr & input_cloud,
   const CudaPolarVoxelNoiseFilterParameters & params, const PolarDataType polar_type)
 {
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  static int count_s = 0;
+  static float accomulated_time = 0.0f;
+
+  // Record start event on the current stream
+  cudaEventRecord(start, stream_);
   if (!primary_return_type_dev_) {
-    return FilterReturn{nullptr, nullptr};
+    return FilterReturn{nullptr, nullptr, nullptr};
   }
 
   size_t num_points = input_cloud->width * input_cloud->height;
@@ -664,7 +1350,240 @@ CudaPolarVoxelNoiseFilter::FilterReturn CudaPolarVoxelNoiseFilter::filter(
     // For such cases, this filter returns empty results
     auto empty_filtered_cloud = std::make_unique<cuda_blackboard::CudaPointCloud2>();
     auto empty_noise_cloud = std::make_unique<cuda_blackboard::CudaPointCloud2>();
-    return FilterReturn{std::move(empty_filtered_cloud), std::move(empty_noise_cloud)};
+    auto empty_ground_cloud = std::make_unique<cuda_blackboard::CudaPointCloud2>();
+    return FilterReturn{
+      std::move(empty_filtered_cloud), std::move(empty_noise_cloud), std::move(empty_ground_cloud)};
+  }
+
+  if (params.use_near_far_zones) {
+    const size_t point_step = input_cloud->point_step;
+    std::vector<uint8_t> host_data(num_points * point_step);
+    CHECK_CUDA_ERROR(cudaMemcpyAsync(
+      host_data.data(), input_cloud->data.get(), host_data.size(), cudaMemcpyDeviceToHost,
+      stream_));
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(stream_));
+
+    const size_t x_offset = get_offset(input_cloud->fields, "x");
+    const size_t y_offset = get_offset(input_cloud->fields, "y");
+    const size_t z_offset = get_offset(input_cloud->fields, "z");
+    const size_t intensity_offset = get_offset(input_cloud->fields, "intensity");
+    const size_t return_type_offset = get_offset(input_cloud->fields, "return_type");
+
+    std::vector<ZonePoint> all_points;
+    all_points.reserve(num_points);
+    for (size_t i = 0; i < num_points; ++i) {
+      all_points.push_back(ZonePoint{
+        get_host_element_value<float>(host_data, i, point_step, x_offset),
+        get_host_element_value<float>(host_data, i, point_step, y_offset),
+        get_host_element_value<float>(host_data, i, point_step, z_offset),
+        static_cast<float>(get_host_element_value<uint8_t>(host_data, i, point_step, intensity_offset)),
+        static_cast<int>(get_host_element_value<uint8_t>(host_data, i, point_step, return_type_offset))});
+    }
+
+    std::vector<bool> valid_mask(num_points, true);
+    std::vector<bool> ground_mask(num_points, false);
+    std::vector<bool> possible_noise_mask(num_points, false);
+    std::vector<bool> low_count_mask(num_points, false);
+    std::vector<bool> signal_mask(num_points, false);
+    std::vector<bool> misclassified_noise_mask(num_points, false);
+    std::vector<bool> low_intensity_mask(num_points, false);
+    for (size_t i = 0; i < num_points; ++i) {
+      low_intensity_mask[i] = all_points[i].intensity < static_cast<float>(params.intensity_threshold);
+    }
+
+    const auto zones = build_zones(params);
+    for (const auto & zone : zones) {
+      std::vector<size_t> in_zone;
+      in_zone.reserve(num_points);
+      for (size_t i = 0; i < num_points; ++i) {
+        const auto & p = all_points[i];
+        const double rho = std::sqrt(static_cast<double>(p.x * p.x + p.y * p.y));
+        if (rho < zone.r_min || rho > zone.r_max) continue;
+        if (p.z < zone.z_min || p.z > zone.z_max) continue;
+        if (!low_intensity_mask[i]) continue;
+        in_zone.push_back(i);
+      }
+      if (in_zone.empty()) continue;
+
+      using Key = std::array<int, 3>;
+      std::map<Key, std::vector<size_t>> voxels;
+      const int max_z =
+        std::max(1, static_cast<int>((zone.z_max - zone.z_min) / zone.z_step) + 1);
+
+      for (const size_t idx : in_zone) {
+        const auto & p = all_points[idx];
+        const double rho = std::sqrt(static_cast<double>(p.x * p.x + p.y * p.y));
+        const double phi = std::atan2(static_cast<double>(p.y), static_cast<double>(p.x));
+        const int r_idx = static_cast<int>((rho - zone.r_min) / zone.r_step);
+        const int az_idx = static_cast<int>((phi + M_PI) / zone.az_step);
+        int z_idx = static_cast<int>((p.z - zone.z_min) / zone.z_step);
+        z_idx = std::clamp(z_idx, 0, max_z - 1);
+        voxels[Key{{r_idx, az_idx, z_idx}}].push_back(idx);
+      }
+
+      std::vector<ZoneVoxelRecord> voxel_records;
+      voxel_records.reserve(voxels.size());
+      std::unordered_map<ZoneVoxelCoord, size_t, ZoneVoxelCoordHash> coord_to_record_idx;
+      coord_to_record_idx.reserve(voxels.size());
+
+      for (const auto & [key, indices] : voxels) {
+        float int_avg = 0.0f;
+        for (const size_t idx : indices) int_avg += all_points[idx].intensity;
+        int_avg /= static_cast<float>(indices.size());
+        const int count = static_cast<int>(indices.size());
+
+        ZoneVoxelRecord rec;
+        rec.zone_name = zone.name;
+        rec.coord = ZoneVoxelCoord{key[0], key[1], key[2]};
+        rec.point_indices = indices;
+        rec.category = find_voxel_category(count, int_avg, nullptr, zone.name, params);
+        rec.is_noise = is_noise_category(rec.category);
+
+        if (rec.category == VoxelCategory::kLowCountLowIntensity) {
+          for (const size_t idx : indices) {
+            valid_mask[idx] = false;
+            low_count_mask[idx] = true;
+            ground_mask[idx] = false;
+            signal_mask[idx] = false;
+            possible_noise_mask[idx] = false;
+            misclassified_noise_mask[idx] = false;
+          }
+        } else if (rec.category == VoxelCategory::kLowCountOnly) {
+          for (const size_t idx : indices) {
+            possible_noise_mask[idx] = true;
+            low_count_mask[idx] = true;
+          }
+        } else {
+          VoxelMetrics metrics;
+          if (compute_metrics(
+                all_points, indices, primary_return_types_host_, params.secondary_return_types,
+                metrics)) {
+            rec.metrics = metrics;
+            rec.has_metrics = true;
+            rec.category = find_voxel_category(count, int_avg, &rec.metrics, zone.name, params);
+            rec.is_noise = is_noise_category(rec.category);
+          }
+
+          for (const size_t idx : indices) {
+            if (rec.category == VoxelCategory::kGround) {
+              ground_mask[idx] = true;
+              valid_mask[idx] = true;
+            } else if (rec.category == VoxelCategory::kNoise) {
+              valid_mask[idx] = false;
+            } else if (rec.category == VoxelCategory::kSignal) {
+              signal_mask[idx] = true;
+            } else if (rec.category == VoxelCategory::kMisclassifiedNoise) {
+              misclassified_noise_mask[idx] = true;
+            } else if (rec.category == VoxelCategory::kPossibleNoise) {
+              possible_noise_mask[idx] = true;
+            }
+          }
+        }
+
+        voxel_records.push_back(rec);
+        coord_to_record_idx[rec.coord] = voxel_records.size() - 1U;
+      }
+
+      if (params.run_ground_refinement) {
+        const auto refined_ground_mask = apply_polynomial_refinement(
+          all_points, ground_mask,
+          static_cast<float>(params.ground_refinement_distance_threshold),
+          static_cast<float>(params.ground_refinement_voxel_size));
+
+        for (auto & rec : voxel_records) {
+          if (rec.point_indices.empty()) continue;
+          size_t refined_count = 0;
+          for (const size_t idx : rec.point_indices) {
+            if (idx < refined_ground_mask.size() && refined_ground_mask[idx]) refined_count++;
+          }
+          const float refined_ratio =
+            static_cast<float>(refined_count) / static_cast<float>(rec.point_indices.size());
+          const bool claimed_as_ground =
+            refined_ratio > static_cast<float>(params.ground_refinement_claim_ratio);
+
+          if (rec.category == VoxelCategory::kGround && !claimed_as_ground) {
+            rec.category = VoxelCategory::kPossibleNoise;
+            rec.is_noise = false;
+            for (const size_t idx : rec.point_indices) {
+              ground_mask[idx] = false;
+              valid_mask[idx] = true;
+              possible_noise_mask[idx] = true;
+              low_count_mask[idx] = false;
+              signal_mask[idx] = false;
+              misclassified_noise_mask[idx] = false;
+            }
+            continue;
+          }
+
+          if (claimed_as_ground) {
+            rec.category = VoxelCategory::kGround;
+            rec.is_noise = false;
+            for (const size_t idx : rec.point_indices) {
+              ground_mask[idx] = true;
+              valid_mask[idx] = true;
+              possible_noise_mask[idx] = false;
+              low_count_mask[idx] = false;
+              signal_mask[idx] = false;
+              misclassified_noise_mask[idx] = false;
+            }
+          }
+        }
+      }
+
+      if (params.run_second_refinement) {
+        second_pass_refinement_after_ground(
+          voxel_records, coord_to_record_idx, valid_mask, ground_mask, possible_noise_mask,
+          low_count_mask, signal_mask, misclassified_noise_mask, params.second_refinement_radius);
+      }
+    }
+
+    const auto upload_mask = [&](const std::vector<bool> & host_mask) {
+      auto device_mask = autoware::cuda_utils::make_unique<bool>(num_points, stream_, mem_pool_);
+      std::vector<uint8_t> raw_mask(num_points, 0U);
+      for (size_t i = 0; i < num_points; ++i) raw_mask[i] = host_mask[i] ? 1U : 0U;
+      CHECK_CUDA_ERROR(cudaMemcpyAsync(
+        device_mask.get(), raw_mask.data(), raw_mask.size() * sizeof(uint8_t),
+        cudaMemcpyHostToDevice, stream_));
+      return device_mask;
+    };
+
+    cudaEventRecord(stop, stream_);
+
+    // Wait for the stop event to be reached
+    cudaEventSynchronize(stop);
+
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    accomulated_time += milliseconds;
+    count_s++;
+    if (count_s >= 30) {
+      accomulated_time /= count_s;
+      std::cout << "GPU Filter Time: this loop " << milliseconds << " , average " << accomulated_time << " ms" << std::endl;
+      count_s = 0;
+      accomulated_time = 0.0f;
+    }
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    auto filtered_cloud = std::make_unique<cuda_blackboard::CudaPointCloud2>();
+    auto valid_points_mask = upload_mask(valid_mask);
+    std::ignore = create_output(input_cloud, valid_points_mask, num_points, filtered_cloud);
+
+    auto noise_cloud = std::make_unique<cuda_blackboard::CudaPointCloud2>();
+    if (params.publish_noise_cloud) {
+      std::vector<bool> noise_mask(num_points, false);
+      for (size_t i = 0; i < num_points; ++i) noise_mask[i] = !valid_mask[i];
+      auto noise_points_mask = upload_mask(noise_mask);
+      std::ignore = create_output(input_cloud, noise_points_mask, num_points, noise_cloud);
+    }
+
+    auto ground_cloud = std::make_unique<cuda_blackboard::CudaPointCloud2>();
+    if (params.publish_ground_cloud) {
+      auto ground_points_mask = upload_mask(ground_mask);
+      std::ignore = create_output(input_cloud, ground_points_mask, num_points, ground_cloud);
+    }
+
+    return {std::move(filtered_cloud), std::move(noise_cloud), std::move(ground_cloud)};
   }
 
   FieldDataComposer<size_t> offsets{};
@@ -695,6 +1614,21 @@ CudaPolarVoxelNoiseFilter::FilterReturn CudaPolarVoxelNoiseFilter::filter(
   CudaPooledUniquePtr<float> intensity_sums = nullptr;
   CudaPooledUniquePtr<size_t> secondary_counts = nullptr;
   CudaPooledUniquePtr<bool> is_primary_flags = nullptr;
+  CudaPooledUniquePtr<float> sum_x = nullptr;
+  CudaPooledUniquePtr<float> sum_y = nullptr;
+  CudaPooledUniquePtr<float> sum_z = nullptr;
+  CudaPooledUniquePtr<float> sum_xx = nullptr;
+  CudaPooledUniquePtr<float> sum_xy = nullptr;
+  CudaPooledUniquePtr<float> sum_xz = nullptr;
+  CudaPooledUniquePtr<float> sum_yy = nullptr;
+  CudaPooledUniquePtr<float> sum_yz = nullptr;
+  CudaPooledUniquePtr<float> sum_zz = nullptr;
+  CudaPooledUniquePtr<float> min_x = nullptr;
+  CudaPooledUniquePtr<float> min_y = nullptr;
+  CudaPooledUniquePtr<float> min_z = nullptr;
+  CudaPooledUniquePtr<float> max_x = nullptr;
+  CudaPooledUniquePtr<float> max_y = nullptr;
+  CudaPooledUniquePtr<float> max_z = nullptr;
 
   // First pass: count points in each polar voxel using pre-computed coordinates
   {
@@ -753,20 +1687,59 @@ CudaPolarVoxelNoiseFilter::FilterReturn CudaPolarVoxelNoiseFilter::filter(
       autoware::cuda_utils::make_unique<size_t>(num_total_voxels, stream_, mem_pool_);
     is_primary_flags = autoware::cuda_utils::make_unique<bool>(num_points, stream_, mem_pool_);
 
+    sum_x = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+    sum_y = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+    sum_z = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+    sum_xx = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+    sum_xy = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+    sum_xz = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+    sum_yy = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+    sum_yz = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+    sum_zz = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+    min_x = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+    min_y = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+    min_z = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+    max_x = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+    max_y = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+    max_z = autoware::cuda_utils::make_unique<float>(num_total_voxels, stream_, mem_pool_);
+
     // Ensure buffers are zeroed (crucial for atomicAdd)
     cudaMemsetAsync(total_counts.get(), 0, num_total_voxels * sizeof(size_t), stream_);
     cudaMemsetAsync(intensity_sums.get(), 0, num_total_voxels * sizeof(float), stream_);
     cudaMemsetAsync(secondary_counts.get(), 0, num_total_voxels * sizeof(size_t), stream_);
+    cudaMemsetAsync(sum_x.get(), 0, num_total_voxels * sizeof(float), stream_);
+    cudaMemsetAsync(sum_y.get(), 0, num_total_voxels * sizeof(float), stream_);
+    cudaMemsetAsync(sum_z.get(), 0, num_total_voxels * sizeof(float), stream_);
+    cudaMemsetAsync(sum_xx.get(), 0, num_total_voxels * sizeof(float), stream_);
+    cudaMemsetAsync(sum_xy.get(), 0, num_total_voxels * sizeof(float), stream_);
+    cudaMemsetAsync(sum_xz.get(), 0, num_total_voxels * sizeof(float), stream_);
+    cudaMemsetAsync(sum_yy.get(), 0, num_total_voxels * sizeof(float), stream_);
+    cudaMemsetAsync(sum_yz.get(), 0, num_total_voxels * sizeof(float), stream_);
+    cudaMemsetAsync(sum_zz.get(), 0, num_total_voxels * sizeof(float), stream_);
+    {
+      dim3 block_dim_vox(512);
+      dim3 grid_dim_vox((num_total_voxels + block_dim_vox.x - 1) / block_dim_vox.x);
+      init_minmax_kernel<<<grid_dim_vox, block_dim_vox, 0, stream_>>>(
+        min_x.get(), min_y.get(), min_z.get(), max_x.get(), max_y.get(), max_z.get(),
+        num_total_voxels);
+    }
 
     const size_t return_type_offset = get_offset(input_cloud->fields, "return_type");
     const size_t intensity_offset = get_offset(input_cloud->fields, "intensity");
+    const size_t x_offset = get_offset(input_cloud->fields, "x");
+    const size_t y_offset = get_offset(input_cloud->fields, "y");
+    const size_t z_offset = get_offset(input_cloud->fields, "z");
 
     dim3 grid_dim_points((num_points + block_dim.x - 1) / block_dim.x);
     classify_point_and_sum_stats_kernel<uint8_t, uint8_t><<<grid_dim_points, block_dim, 0, stream_>>>(
       input_cloud->data.get(), num_points, num_total_voxels, input_cloud->point_step,
-      return_type_offset, intensity_offset, primary_return_type_dev_.value(),
+      return_type_offset, intensity_offset, x_offset, y_offset, z_offset,
+      primary_return_type_dev_.value(), static_cast<uint8_t>(params.intensity_threshold),
       point_indices.get(), voxel_indices.get(),
-      total_counts.get(), intensity_sums.get(), secondary_counts.get(), is_primary_flags.get());
+      total_counts.get(), intensity_sums.get(), secondary_counts.get(), is_primary_flags.get(),
+      sum_x.get(), sum_y.get(), sum_z.get(),
+      sum_xx.get(), sum_xy.get(), sum_xz.get(), sum_yy.get(), sum_yz.get(), sum_zz.get(),
+      min_x.get(), min_y.get(), min_z.get(), max_x.get(), max_y.get(), max_z.get());
     // classify_point_by_return_type_and_intensity_kernel<uint8_t, uint8_t>
     //   <<<grid_dim, block_dim, 0, stream_>>>(
     //     input_cloud->data.get(), num_points, num_total_voxels, input_cloud->point_step,
@@ -780,14 +1753,23 @@ CudaPolarVoxelNoiseFilter::FilterReturn CudaPolarVoxelNoiseFilter::filter(
   // Evaluate voxel validity with CPU-equivalent criteria, then build per-point mask
   auto voxel_valid_mask =
     autoware::cuda_utils::make_unique<bool>(num_total_voxels, stream_, mem_pool_);
+  auto voxel_ground_mask =
+    autoware::cuda_utils::make_unique<bool>(num_total_voxels, stream_, mem_pool_);
+  auto voxel_category =
+    autoware::cuda_utils::make_unique<uint8_t>(num_total_voxels, stream_, mem_pool_);
   {
     dim3 block_dim(512);
     dim3 grid_dim_vox((num_total_voxels + block_dim.x - 1) / block_dim.x);
-    evaluate_voxel_validity_kernel<<<grid_dim_vox, block_dim, 0, stream_>>>(
-      total_counts.get(), intensity_sums.get(), secondary_counts.get(), num_total_voxels,
-      params.voxel_points_threshold, params.avg_intensity_threshold,
-      params.secondary_noise_threshold, params.use_return_type_classification,
-      voxel_valid_mask.get());
+    compute_voxel_category_kernel<<<grid_dim_vox, block_dim, 0, stream_>>>(
+      total_counts.get(), intensity_sums.get(), secondary_counts.get(),
+      sum_x.get(), sum_y.get(), sum_z.get(),
+      sum_xx.get(), sum_xy.get(), sum_xz.get(), sum_yy.get(), sum_yz.get(), sum_zz.get(),
+      min_x.get(), min_y.get(), min_z.get(), max_x.get(), max_y.get(), max_z.get(),
+      num_total_voxels,
+      params.voxel_noise_low_count_threshold,
+      static_cast<float>(params.voxel_noise_intensity_avg_threshold),
+      params.voxel_noise_ret_secondary_threshold,
+      voxel_category.get(), voxel_valid_mask.get(), voxel_ground_mask.get());
 
     dim3 grid_dim_pts((num_points + block_dim.x - 1) / block_dim.x);
     point_validity_check_kernel<<<grid_dim_pts, block_dim, 0, stream_>>>(
@@ -824,6 +1806,20 @@ CudaPolarVoxelNoiseFilter::FilterReturn CudaPolarVoxelNoiseFilter::filter(
     std::ignore = create_output(input_cloud, valid_points_mask, num_points, noise_cloud);
   }
 
+  // Create ground cloud if requested (category==Ground)
+  auto ground_cloud = std::make_unique<cuda_blackboard::CudaPointCloud2>();
+  if (params.publish_ground_cloud) {
+    // build point mask for ground points
+    auto ground_points_mask = autoware::cuda_utils::make_unique<bool>(num_points, stream_, mem_pool_);
+    dim3 block_dim(512);
+    dim3 grid_dim_pts((num_points + block_dim.x - 1) / block_dim.x);
+    // reuse point_validity_check_kernel shape: treat ground voxels as valid and ignore secondary filter
+    point_validity_check_kernel<<<grid_dim_pts, block_dim, 0, stream_>>>(
+      voxel_ground_mask.get(), point_indices.get(), voxel_indices.get(), is_primary_flags.get(),
+      num_points, num_total_voxels, false, ground_points_mask.get());
+    std::ignore = create_output(input_cloud, ground_points_mask, num_points, ground_cloud);
+  }
+
   // Calculate filter ratio and visibility (only when return type classification is enabled)
 
   // double visibility = 0.0;
@@ -835,12 +1831,14 @@ CudaPolarVoxelNoiseFilter::FilterReturn CudaPolarVoxelNoiseFilter::filter(
 
   }
 
-  return {std::move(filtered_cloud), std::move(noise_cloud)};
+  return {std::move(filtered_cloud), std::move(noise_cloud), std::move(ground_cloud)};
 }
 
 void CudaPolarVoxelNoiseFilter::set_return_types(
   const std::vector<int> & types, std::optional<ReturnTypeCandidates> & types_dev)
 {
+  primary_return_types_host_ = types;
+
   if (types_dev) {
     // Reset previously allocated region to refresh the parameters
     CHECK_CUDA_ERROR(cudaFreeAsync(types_dev.value().return_types, stream_));
