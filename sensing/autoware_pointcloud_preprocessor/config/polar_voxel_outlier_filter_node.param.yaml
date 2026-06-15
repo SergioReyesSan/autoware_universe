@@ -18,12 +18,15 @@
     use_return_type_classification: true         # Whether to use return type classification
     filter_secondary_returns: false              # Whether to filter secondary returns (keep only primary when true)
     secondary_noise_threshold: 4                 # Threshold for classifying primary vs secondary returns
+    low_visibility_entropy_threshold: 0.3        # Minimum normalized geometric entropy for low-visibility candidate voxels
+    low_visibility_anisotropy_threshold: 0.95     # Maximum geometric anisotropy for low-visibility candidate voxels
     visibility_estimation_max_secondary_voxel_count: 500  # Maximum secondary voxel count for visibility estimation
     primary_return_types: [1, 6, 8, 10]          # Return types considered as primary returns (all others are secondary)
 
     # Performance and debug control
     visibility_estimation_only: false           # Run filter for visibility estimation only (no point cloud output)
     publish_noise_cloud: true                    # Generate and publish noise cloud for debugging (true for development)
+    publish_low_visibility_voxels: true         # Publish points in selected low-visibility voxels for debugging
     publish_area_marker: false                   # Publish a marker to visualize region used for visibility estimation
 
     # Diagnostic thresholds
