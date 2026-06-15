@@ -107,6 +107,20 @@
           "default": "500",
           "minimum": 0
         },
+        "low_visibility_entropy_threshold": {
+          "type": "number",
+          "description": "Minimum normalized geometric Shannon entropy for low-visibility voxel selection.",
+          "default": "0.5",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "low_visibility_anisotropy_threshold": {
+          "type": "number",
+          "description": "Maximum normalized geometric anisotropy for low-visibility voxel selection.",
+          "default": "0.95",
+          "minimum": 0,
+          "maximum": 1
+        },
         "primary_return_types": {
           "type": "array",
           "description": "List of return type values considered as primary returns (all others are secondary).",
@@ -194,6 +208,8 @@
         "filter_secondary_returns",
         "secondary_noise_threshold",
         "visibility_estimation_max_secondary_voxel_count",
+        "low_visibility_entropy_threshold",
+        "low_visibility_anisotropy_threshold",
         "primary_return_types",
         "visibility_estimation_only",
         "publish_noise_cloud",

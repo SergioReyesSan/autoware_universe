@@ -78,13 +78,20 @@ struct PointVoxelInfo
   PolarVoxelIndex voxel_idx;
   bool is_primary{false};
   bool meets_intensity_threshold{false};
+  double x{};
+  double y{};
+  double z{};
 
   PointVoxelInfo() = default;
   explicit PointVoxelInfo(
-    const PolarVoxelIndex & voxel_idx, bool is_primary, bool meets_intensity_threshold)
+    const PolarVoxelIndex & voxel_idx, bool is_primary, bool meets_intensity_threshold,
+    double x = 0.0, double y = 0.0, double z = 0.0)
   : voxel_idx(voxel_idx),
     is_primary(is_primary),
-    meets_intensity_threshold(meets_intensity_threshold)
+    meets_intensity_threshold(meets_intensity_threshold),
+    x(x),
+    y(y),
+    z(z)
   {
   }
 };
@@ -95,6 +102,30 @@ struct VoxelPointCounts
   size_t primary_count{0};
   size_t secondary_count{0};
   bool is_in_visibility_range{true};
+  size_t entropy_point_count{0};
+  double sum_x{0.0};
+  double sum_y{0.0};
+  double sum_z{0.0};
+  double sum_xx{0.0};
+  double sum_xy{0.0};
+  double sum_xz{0.0};
+  double sum_yy{0.0};
+  double sum_yz{0.0};
+  double sum_zz{0.0};
+
+  void add_entropy_point(double x, double y, double z)
+  {
+    ++entropy_point_count;
+    sum_x += x;
+    sum_y += y;
+    sum_z += z;
+    sum_xx += x * x;
+    sum_xy += x * y;
+    sum_xz += x * z;
+    sum_yy += y * y;
+    sum_yz += y * z;
+    sum_zz += z * z;
+  }
 
   // Threshold checks (inclusive)
   [[nodiscard]] bool meets_primary_threshold(int threshold) const
@@ -135,10 +166,17 @@ public:
     }
   };
 
+  struct GeometricShannonMetrics
+  {
+    double entropy{0.0};
+    double anisotropy{0.0};
+  };
+
 protected:
   // Parameter update helper methods
   void update_primary_return_types(const rclcpp::Parameter & param);
   void update_publish_noise_cloud(const rclcpp::Parameter & param);
+  void update_publish_low_visibility_voxels(const rclcpp::Parameter & param);
 
   // Type aliases to eliminate long type name duplication
   using PointCloud2 = sensor_msgs::msg::PointCloud2;
@@ -166,7 +204,8 @@ protected:
   void publish_noise_cloud(
     const PointCloud2 & input, const ValidPointsMask & valid_points_mask) const;
   void publish_diagnostics(
-    const VoxelPointCountMap & voxel_point_counts, const ValidPointsMask & valid_points_mask);
+    const VoxelPointCountMap & voxel_point_counts, const ValidPointsMask & valid_points_mask,
+    const PointCloud2 & input, const PointVoxelInfoVector & point_voxel_info);
 
   // Point processing helper methods
   void process_polar_points(const PointCloud2 & input, PointVoxelInfoVector & point_voxel_info);
@@ -231,8 +270,14 @@ protected:
   bool enable_secondary_return_filtering_{};
   int secondary_noise_threshold_{};
   int intensity_threshold_{};
+  int visibility_min_delta_radius_idx_{};
+  int visibility_min_delta_azimuth_idx_{};
+  int visibility_min_delta_elevation_idx_{};
+  double low_visibility_entropy_threshold_{};
+  double low_visibility_anisotropy_threshold_{};
   std::vector<int> primary_return_types_;
   bool publish_noise_cloud_{};
+  bool publish_low_visibility_voxels_{};
   int visibility_estimation_max_secondary_voxel_count_{};
   bool visibility_estimation_only_{};
 
@@ -245,6 +290,7 @@ protected:
   // State variables (protected by mutex_)
   std::optional<double> visibility_;
   std::optional<double> filter_ratio_;
+  std::vector<PolarVoxelIndex> selected_low_visibility_voxels_;
   std::mutex mutex_;
   std::shared_ptr<custom_diagnostic_tasks::HysteresisStateMachine> hysteresis_state_machine_;
 
@@ -252,6 +298,7 @@ protected:
   rclcpp::Publisher<autoware_internal_debug_msgs::msg::Float32Stamped>::SharedPtr visibility_pub_;
   rclcpp::Publisher<autoware_internal_debug_msgs::msg::Float32Stamped>::SharedPtr ratio_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr noise_cloud_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr low_visibility_voxels_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr area_marker_pub_;
   diagnostic_updater::Updater updater_;
   OnSetParametersCallbackHandle::SharedPtr set_param_res_;
@@ -261,6 +308,8 @@ protected:
   void calculate_filter_ratio_metric(const ValidPointsMask & valid_points_mask);
   void publish_visibility_metric();
   void publish_filter_ratio_metric();
+  void publish_low_visibility_voxels(
+    const PointCloud2 & input, const PointVoxelInfoVector & point_voxel_info) const;
   void publish_area_marker(const std_msgs::msg::Header & input_header);
 
   // Filter pipeline helper methods
@@ -273,6 +322,9 @@ protected:
   bool has_finite_coordinates(const PolarCoordinate & polar) const;
   bool is_within_radius_range(const PolarCoordinate & polar) const;
   bool has_sufficient_radius(const PolarCoordinate & polar) const;
+  CartesianCoordinate polar_voxel_center_to_cartesian(const PolarVoxelIndex & voxel_idx) const;
+  GeometricShannonMetrics calculate_geometric_shannon_metrics(
+    const VoxelPointCounts & counts) const;
 
   // Point validation helper methods for mask creation
   bool is_point_valid_for_mask(

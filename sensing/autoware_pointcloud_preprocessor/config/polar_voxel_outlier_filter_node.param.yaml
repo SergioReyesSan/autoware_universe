@@ -19,6 +19,8 @@
     filter_secondary_returns: false              # Whether to filter secondary returns (keep only primary when true)
     secondary_noise_threshold: 4                 # Threshold for classifying primary vs secondary returns
     visibility_estimation_max_secondary_voxel_count: 500  # Maximum secondary voxel count for visibility estimation
+    low_visibility_entropy_threshold: 0.5        # Minimum normalized geometric Shannon entropy for low-visibility voxel selection
+    low_visibility_anisotropy_threshold: 0.95    # Maximum normalized geometric anisotropy for low-visibility voxel selection
     primary_return_types: [1, 6, 8, 10]          # Return types considered as primary returns (all others are secondary)
 
     # Performance and debug control
