@@ -7765,6 +7765,8 @@
           
         
       
+        
+      
     
     
     
@@ -7804,6 +7806,11 @@
 
             </a>
             
+              
+              <label class="md-nav__link " for="__nav_7_11" id="__nav_7_11_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
           </div>
         
         <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_7_11_label" aria-expanded="false">
@@ -7817,6 +7824,100 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_7_11_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_7_11_2" id="__nav_7_11_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Docs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_7_11_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7_11_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Docs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../autoware_euclidean_cluster/docs/label-based-euclidean-cluster/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Label based euclidean cluster
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
               
             
           </ul>
@@ -9108,6 +9209,8 @@
           
         
       
+        
+      
     
     
     
@@ -9147,6 +9250,11 @@
 
             </a>
             
+              
+              <label class="md-nav__link " for="__nav_7_22" id="__nav_7_22_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
           </div>
         
         <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_7_22_label" aria-expanded="false">
@@ -9160,6 +9268,100 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_7_22_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_7_22_2" id="__nav_7_22_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Docs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_7_22_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7_22_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Docs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../autoware_object_merger/docs/object_fusion_merger/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    object_fusion_merger
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
               
             
           </ul>
@@ -23245,6 +23447,15 @@ This requires the installation of <code>spconv_cpp</code> which is automatically
 <p>We provide a wrapper for the <code>bev_pool</code> operation presented in <a href="https://github.com/mit-han-lab/bevfusion">BEVFusion</a>. Please refer to the original paper for specific details.</p>
 <h3 id="scatter-operations">Scatter operations<a class="headerlink" href="#scatter-operations" title="Permanent link">#</a></h3>
 <p>We provide a wrapper for the <code>segment_csr</code> operation presented in <a href="https://github.com/rusty1s/pytorch_scatter/tree/master">torch_scatter</a>. Please refer to the original code for specific details.</p>
+<p>The <code>SegmentCSR</code> TensorRT plugin supports a 2D source tensor and a 1D CSR row pointer:</p>
+<ul>
+<li><code>src</code>: row-major tensor with shape <code>[num_rows, num_cols]</code></li>
+<li><code>indptr</code>: int64 tensor with shape <code>[num_segments + 1]</code></li>
+<li><code>output</code>: tensor with shape <code>[num_segments, num_cols]</code></li>
+</ul>
+<p>Each output row reduces the contiguous source rows <code>src[indptr[s] : indptr[s + 1]]</code> independently
+for every column. Higher-rank/batched CSR inputs are not part of this plugin contract; callers
+should flatten or reshape inputs before invoking the plugin.</p>
 <h3 id="unique">Unique<a class="headerlink" href="#unique" title="Permanent link">#</a></h3>
 <p>While ONNX supports the unique operation, TensorRT does not provide an implementation. For this reason we implement <code>Unique</code> as <code>CustomUnique</code> to avoid name classes.
 The implementation mostly follows <a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/Unique.cu">torch_scatter</a> implementation. Please refer to the original code for specific details.</p>

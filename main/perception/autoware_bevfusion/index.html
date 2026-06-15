@@ -7765,6 +7765,8 @@
           
         
       
+        
+      
     
     
     
@@ -7804,6 +7806,11 @@
 
             </a>
             
+              
+              <label class="md-nav__link " for="__nav_7_11" id="__nav_7_11_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
           </div>
         
         <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_7_11_label" aria-expanded="false">
@@ -7817,6 +7824,100 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_7_11_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_7_11_2" id="__nav_7_11_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Docs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_7_11_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7_11_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Docs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../autoware_euclidean_cluster/docs/label-based-euclidean-cluster/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Label based euclidean cluster
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
               
             
           </ul>
@@ -9108,6 +9209,8 @@
           
         
       
+        
+      
     
     
     
@@ -9147,6 +9250,11 @@
 
             </a>
             
+              
+              <label class="md-nav__link " for="__nav_7_22" id="__nav_7_22_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
           </div>
         
         <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_7_22_label" aria-expanded="false">
@@ -9160,6 +9268,100 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_7_22_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_7_22_2" id="__nav_7_22_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Docs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_7_22_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7_22_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Docs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../autoware_object_merger/docs/object_fusion_merger/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    object_fusion_merger
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
               
             
           </ul>
@@ -23497,6 +23699,20 @@ Autoware installs it automatically in its setup script. If needed, the user can 
 <td>[0.1, 0.1, 0.1, 0.1]</td>
 <td>N/A</td>
 </tr>
+<tr>
+<td>min_confidence_scores.TRAFFIC_CONE</td>
+<td>array</td>
+<td>A minimum confidence score for TRAFFIC_CONE in each distance bin.</td>
+<td>[0.1, 0.1, 0.1, 0.1]</td>
+<td>N/A</td>
+</tr>
+<tr>
+<td>min_confidence_scores.BARRIER</td>
+<td>array</td>
+<td>A minimum confidence score for BARRIER in each distance bin.</td>
+<td>[0.1, 0.1, 0.1, 0.1]</td>
+<td>N/A</td>
+</tr>
 </tbody>
 </table>
 <h3 id="bevfusion-model">BEVFusion model<a class="headerlink" href="#bevfusion-model" title="Permanent link">#</a></h3>
@@ -23515,7 +23731,7 @@ Autoware installs it automatically in its setup script. If needed, the user can 
 <td>class_names</td>
 <td>array</td>
 <td>Predicted classes' names.</td>
-<td>['CAR', 'TRUCK', 'BUS', 'BICYCLE', 'PEDESTRIAN']</td>
+<td>['CAR', 'TRUCK', 'BUS', 'BICYCLE', 'PEDESTRIAN', 'TRAFFIC_CONE', 'BARRIER']</td>
 <td>N/A</td>
 </tr>
 <tr>
@@ -23689,22 +23905,22 @@ Autoware installs it automatically in its setup script. If needed, the user can 
 <tr>
 <td>allow_remapping_by_area_matrix</td>
 <td>array</td>
-<td>Whether to allow remapping of classes. The order of 8x8 matrix classes comes from ObjectClassification msg.</td>
-<td>[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]</td>
+<td>Whether to allow remapping of classes. The order of 10x10 matrix classes comes from ObjectClassification msg.</td>
+<td>[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]</td>
 <td>N/A</td>
 </tr>
 <tr>
 <td>min_area_matrix</td>
 <td>array</td>
 <td>Minimum area for specific class to consider class remapping.</td>
-<td>[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 12.1, 0.0, 36.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 36.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 36.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]</td>
+<td>[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 12.1, 0.0, 36.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 36.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 36.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]</td>
 <td>N/A</td>
 </tr>
 <tr>
 <td>max_area_matrix</td>
 <td>array</td>
 <td>Maximum area for specific class to consider class remapping.</td>
-<td>[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 36.0, 0.0, 999.999, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 999.999, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 999.999, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]</td>
+<td>[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 36.0, 0.0, 999.999, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 999.999, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 999.999, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]</td>
 <td>N/A</td>
 </tr>
 </tbody>
