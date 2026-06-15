@@ -456,7 +456,7 @@ void PolarVoxelOutlierFilterComponent::publish_diagnostics(
   publish_filter_ratio_metric();
   publish_low_visibility_voxels(input, point_voxel_info);
 
-  updater_.force_update();
+  // updater_.force_update();
 }
 
 void PolarVoxelOutlierFilterComponent::calculate_visibility_metric(
